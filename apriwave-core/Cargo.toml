@@ -1,0 +1,18 @@
+[package]
+name = "apriwave-core"
+version = "4.0.0"
+edition = "2021"
+description = "ApriWave (ApricotWave Protocol v4.0) core: no_std + alloc, zero-dependency deterministic grammar, analysis, indexed M2M form, DTI, execution plan and policy"
+authors = ["irandamarym"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/irandamarym/apriwave"
+readme = "../README.md"
+keywords = ["protocol", "parser", "no-std", "embedded", "m2m"]
+categories = ["no-std", "embedded", "parser-implementations"]
+
+[lib]
+name = "apriwave_core"
+path = "src/lib.rs"
+
+# Zero external dependencies (bare-metal targets: no_std + alloc).
+[dependencies]

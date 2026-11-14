@@ -1,0 +1,20 @@
+# Rust build output
+target/
+**/*.rs.bk
+
+# DTI binary caches (`foo.awdti` -> `foo.dti.bin`) and their temporary files
+*.dti.bin
+*.dti.bin.tmp*
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Not published: legacy v3 sources and scratch material
+legacy/
+scratch/
+
+# Original Word manuals (superseded by docs/Manuale_Tecnico_ApriWave_v4.0.md)
+*.docx
