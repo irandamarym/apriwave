@@ -7,7 +7,7 @@
 
 use crate::prelude::*;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 
 use crate::analyze::{self, AnalyzedPeriod, Binding, BindingId, Committed, GlobalClause, SlotRef};
 use crate::ast::{GlyphSlot, Period, PeriodClose};
@@ -18,6 +18,19 @@ use crate::span::Span;
 use crate::symbol::{Interner, InternerMark, Symbol};
 
 pub use crate::analyze::PeriodId;
+
+/// Glyph / Label classification of a slot (v4.1). In the editor it is the
+/// mandatory selection of the user for every form that the local DTI holds as
+/// a label; a slot without a recorded choice is a glyph (default), which keeps
+/// programmatic and CLI flows deterministic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SlotKind {
+    /// The token is a glyph: transmitted as its DTI key(s).
+    #[default]
+    Glyph,
+    /// The token is a label: transmitted as `LVAAAA<form>`.
+    Label,
+}
 
 /// Why [`Session::compact`] refused to release the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +63,10 @@ pub struct Session {
     carried: Vec<GlobalClause>,
     /// An antecedent exists for `/^≈` and `/^≃` (Q23, D5, R12).
     sync_antecedent: bool,
+    /// Glyph / label choices of the user, by slot (v4.1).
+    slot_kinds: BTreeMap<SlotRef, SlotKind>,
+    /// Label subtypes learnt from received messages (v4.1); `AAA` is built in.
+    label_subtypes: BTreeSet<[u8; 3]>,
     config: ParserConfig,
 }
 
@@ -78,6 +95,11 @@ impl Session {
 
     pub fn periods(&self) -> &[Period] {
         &self.periods
+    }
+
+    /// Identifiers of every period, in chronological order.
+    pub fn period_ids(&self) -> impl DoubleEndedIterator<Item = PeriodId> + '_ {
+        (0..self.periods.len()).filter_map(|index| u32::try_from(index).ok().map(PeriodId))
     }
 
     pub fn period(&self, id: PeriodId) -> Option<&Period> {
@@ -126,6 +148,45 @@ impl Session {
         analyze::slot_in_period(period, slot.clause.clause, slot.slot)
     }
 
+    /// Records the user's Glyph / Label choice for a slot (v4.1). Returns
+    /// `false` (and records nothing) when the slot does not hold a glyph token.
+    pub fn set_slot_kind(&mut self, slot: SlotRef, kind: SlotKind) -> bool {
+        if !matches!(self.glyph_slot(slot), Some(GlyphSlot::Glyph(_))) {
+            return false;
+        }
+        self.slot_kinds.insert(slot, kind);
+        true
+    }
+
+    /// Glyph / Label choice recorded for a slot, if any.
+    pub fn slot_kind(&self, slot: SlotRef) -> Option<SlotKind> {
+        self.slot_kinds.get(&slot).copied()
+    }
+
+    /// Deterministic classification of a slot: the recorded choice, otherwise
+    /// [`SlotKind::Glyph`].
+    pub fn effective_slot_kind(&self, slot: SlotRef) -> SlotKind {
+        self.slot_kind(slot).unwrap_or_default()
+    }
+
+    /// `true` for the base subtype `AAA` and for every subtype registered with
+    /// [`Session::register_label_subtype`].
+    pub fn is_known_label_subtype(&self, code: [u8; 3]) -> bool {
+        code == *b"AAA" || self.label_subtypes.contains(&code)
+    }
+
+    /// Registers a label subtype received from another machine (v4.1). Returns
+    /// `true` when the subtype was not known yet. The table survives
+    /// [`Session::compact`].
+    pub fn register_label_subtype(&mut self, code: [u8; 3]) -> bool {
+        !self.is_known_label_subtype(code) && self.label_subtypes.insert(code)
+    }
+
+    /// Registered (non-base) label subtypes, in byte order.
+    pub fn label_subtypes(&self) -> impl Iterator<Item = [u8; 3]> + '_ {
+        self.label_subtypes.iter().copied()
+    }
+
     // ───────────────────────── Memory release ─────────────────────────
 
     /// Releases every period, analysis, binding and interned text, keeping the
@@ -137,6 +198,7 @@ impl Session {
     /// can influence a later period and future ingestion behaves exactly as on
     /// the uncompacted session. Identifiers obtained before the call
     /// (`PeriodId`, `BindingId`, `Symbol`) become invalid and may be issued again.
+    /// The table of learnt label subtypes is kept.
     pub fn compact(&mut self) -> Result<(), CompactError> {
         let closed = self
             .periods
@@ -145,7 +207,9 @@ impl Session {
         if !closed {
             return Err(CompactError::NotHardClosed);
         }
+        let label_subtypes = core::mem::take(&mut self.label_subtypes);
         *self = Self::with_config(self.config);
+        self.label_subtypes = label_subtypes;
         Ok(())
     }
 
@@ -182,6 +246,9 @@ impl Session {
 
     fn rollback(&mut self, undo: Undo) {
         self.periods.truncate(undo.periods);
+        let periods = undo.periods;
+        self.slot_kinds
+            .retain(|slot, _| (slot.clause.period.index() as usize) < periods);
         self.analyses.truncate(undo.analyses);
         self.bindings.truncate(undo.bindings);
         match undo.variables {
@@ -238,14 +305,19 @@ impl Session {
             }
         };
 
+        // §15: grade every diagnostic; only blocking ones stop the ingestion.
+        let warnings_config = self.config.warnings;
+        let mut diagnostics: Vec<Diagnostic> = diagnostics
+            .into_iter()
+            .map(|d| d.graded(warnings_config))
+            .collect();
         let mut outcome = None;
-        if diagnostics.is_empty() {
+        if diagnostics.iter().all(Diagnostic::is_warning) {
             let Some(first) = ids.first().copied() else {
                 // Stage 1 guarantees at least one period when there are no diagnostics.
                 return Ok((Vec::new(), self.undo_point(mark)));
             };
             let committed = Committed {
-                periods: &self.periods,
                 analyses: &self.analyses,
                 bindings: &self.bindings,
                 variables: &self.variables,
@@ -257,11 +329,24 @@ impl Session {
             }
         }
 
-        let Some(outcome) = outcome else {
+        let Some(mut outcome) = outcome else {
             self.interner.rollback(mark);
             diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
             return Err(diagnostics);
         };
+        // Warnings are attached to the period whose text contains them.
+        diagnostics.append(&mut outcome.warnings);
+        diagnostics.sort_by_key(|d| (d.span.start, d.span.end));
+        for (period, analysis) in periods.iter().zip(outcome.analyses.iter_mut()) {
+            let (start, end) = (period.open.span.start, period.close.span.end);
+            analysis.set_warnings(
+                diagnostics
+                    .iter()
+                    .filter(|d| d.span.start >= start && d.span.start < end)
+                    .copied()
+                    .collect(),
+            );
+        }
 
         // ── Atomic commit (with an undo record) ──
         let mut undo = self.undo_point(mark);

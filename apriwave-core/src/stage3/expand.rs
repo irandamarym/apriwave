@@ -9,14 +9,16 @@
 //!   further value;
 //! - an omitted number inherited by an anaphora or a variable in a case pair is
 //!   written in the rewritten tile (Q18, rule 1B); the signal tile is kept as
-//!   written (its pair never inherits a number, rule 1B);
-//! - `~~` in any even slot (signal glyph slot included) becomes
-//!   `<signal glyph of the antecedent>~~`; a written `glyph~~` stays as written.
+//!   written (an omitted number is inherited again from the parent signal by
+//!   any re-reading, rule 1B v4.1);
+//! - `~~` in any even slot (signal glyph slot included) stays `~~`: it always
+//!   denotes the latest complete sema, which removing `def` and portability
+//!   blocks never changes (they hold no relational clause).
 //!
 //! It is an export error
 //! (never an invalid or semantically different output) when something cannot be
-//! expressed: multi-valued variables in the signal pair or as the base of an
-//! anaphora, depths that need anchors, sema values held in glyph positions.
+//! expressed: multi-valued variables in the signal pair, depths that need
+//! anchors, sema values held in glyph positions.
 //!
 //! The indexed wire form does **not** derive from this form: see `indexed.rs`.
 
@@ -30,12 +32,11 @@ use crate::analyze::{
 };
 use crate::ast::{
     AblativeDeterminer, Case, CaseTile, ClauseRef, Conjunction, ExplicitNumber, GlyphPath,
-    GlyphSlot, PeriodClose, PeriodOpen, QuantumNumber, RelationalBlock, SemaAnaphora,
-    ANAPHORA_MARK, RAW_STRING_QUOTE, SEMA_ANAPHORA_MARK,
+    GlyphSlot, PeriodClose, PeriodOpen, QuantumNumber, RelationalBlock, ANAPHORA_MARK,
+    SEMA_ANAPHORA_MARK,
 };
 use crate::printer::{self, render_glyph_path};
 use crate::session::{PeriodId, Session};
-use crate::symbol::Symbol;
 
 /// Bound on variable indirections followed while flattening values.
 const MAX_VALUE_STEPS: u32 = 1_000_000;
@@ -53,8 +54,7 @@ pub enum WireMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpandError {
     PeriodNotFound(PeriodId),
-    /// A variable with several values (after `absi`) in the signal pair or as the
-    /// base of a `glyph~~` anaphora.
+    /// A variable with several values (after `absi`) in the signal pair.
     MultiValuedVariable {
         clause: ClauseId,
     },
@@ -77,7 +77,7 @@ impl fmt::Display for ExpandError {
             Self::PeriodNotFound(id) => write!(f, "period {} not found", id.index()),
             Self::MultiValuedVariable { clause } => write!(
                 f,
-                "clause {}: multi-valued variable in the signal pair or anaphora base",
+                "clause {}: multi-valued variable in the signal pair",
                 clause.index()
             ),
             Self::InexpressibleDepth { clause } => write!(
@@ -104,9 +104,6 @@ impl core::error::Error for ExpandError {}
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ExpandedGlyph<'s> {
     Path(&'s GlyphPath),
-    Raw(Symbol),
-    /// `glyph~~`
-    SemaByGlyph(&'s GlyphPath),
     /// `~~`
     SemaLatest,
     /// `~` structural marker after `abdur` (B2).
@@ -198,14 +195,6 @@ impl<'s> Expander<'s> {
             .values())
     }
 
-    /// The single final value (`MultiValuedVariable` otherwise).
-    fn single_value(&self, value: SlotValue, clause: ClauseId) -> Result<SlotValue, ExpandError> {
-        match self.flatten(value, clause)?.as_slice() {
-            [single] => Ok(*single),
-            _ => Err(ExpandError::MultiValuedVariable { clause }),
-        }
-    }
-
     /// Glyph-position content of a final (non-variable) value.
     fn final_glyph(
         &self,
@@ -217,50 +206,10 @@ impl<'s> Expander<'s> {
                 .path_of(slot)
                 .map(ExpandedGlyph::Path)
                 .ok_or(ExpandError::InexpressibleValue { clause }),
-            SlotValue::Raw(slot) => match self.session.glyph_slot(slot) {
-                Some(GlyphSlot::RawString(symbol)) => Ok(ExpandedGlyph::Raw(*symbol)),
-                _ => Err(ExpandError::InexpressibleValue { clause }),
-            },
             SlotValue::Sema(_) | SlotValue::Variable(_) => {
                 Err(ExpandError::InexpressibleValue { clause })
             }
         }
-    }
-
-    fn analysis_of(&self, clause: GlobalClause) -> Option<&'s ClauseAnalysis> {
-        self.session
-            .analysis(clause.period)
-            .and_then(|period| period.clause(clause.clause))
-    }
-
-    /// `~~` in a case slot → `<signal glyph of the antecedent>~~`. When the signal
-    /// glyph is not a glyph path (raw string, sema), the first glyph path in
-    /// canonical order is used; `~~` when the block holds no glyph path. Every
-    /// choice resolves back to the same antecedent (it holds the glyph).
-    fn sema_glyph(&self, antecedent: GlobalClause) -> Result<ExpandedGlyph<'s>, ExpandError> {
-        let Some(analysis) = self.analysis_of(antecedent) else {
-            return Ok(ExpandedGlyph::SemaLatest);
-        };
-        if let Some(signal) = analysis.slot(SlotIndex::SIGNAL) {
-            if let SlotValue::Glyph(slot) = self.single_value(signal.value(), antecedent.clause)? {
-                if let Some(path) = self.path_of(slot) {
-                    return Ok(ExpandedGlyph::SemaByGlyph(path));
-                }
-            }
-        }
-        for position in analysis.canonical_order() {
-            let path = analysis
-                .slot(SlotIndex::new(*position))
-                .and_then(|slot| self.single_value(slot.value(), antecedent.clause).ok())
-                .and_then(|value| match value {
-                    SlotValue::Glyph(slot) => self.path_of(slot),
-                    _ => None,
-                });
-            if let Some(path) = path {
-                return Ok(ExpandedGlyph::SemaByGlyph(path));
-            }
-        }
-        Ok(ExpandedGlyph::SemaLatest)
     }
 
     /// Final values of a pair (several only for multi-valued variables).
@@ -273,7 +222,6 @@ impl<'s> Expander<'s> {
         match slot.resolution() {
             Resolution::Literal => match written {
                 GlyphSlot::Glyph(path) => Ok(vec![ExpandedGlyph::Path(path)]),
-                GlyphSlot::RawString(symbol) => Ok(vec![ExpandedGlyph::Raw(*symbol)]),
                 GlyphSlot::GlyphAnaphora(_) | GlyphSlot::SemaAnaphora(_) => {
                     Err(ExpandError::InexpressibleValue { clause })
                 }
@@ -288,18 +236,13 @@ impl<'s> Expander<'s> {
                 .into_iter()
                 .map(|value| self.final_glyph(value, clause))
                 .collect(),
-            Resolution::SemaAnaphora { clause: antecedent } => Ok(vec![match written {
-                GlyphSlot::SemaAnaphora(SemaAnaphora::ByGlyph { glyph }) => {
-                    ExpandedGlyph::SemaByGlyph(glyph)
-                }
-                _ => self.sema_glyph(antecedent)?,
-            }]),
+            Resolution::SemaAnaphora { .. } => Ok(vec![ExpandedGlyph::SemaLatest]),
         }
     }
 
     /// Signal pair followed by the case pairs of a relational clause. Every even
-    /// slot follows the same rules (a sema anaphora becomes `<glyph>~~` in the
-    /// signal glyph slot exactly as in a case slot).
+    /// slot follows the same rules (a sema anaphora stays `~~` in the signal
+    /// glyph slot exactly as in a case slot).
     fn clause(
         &self,
         block: &'s RelationalBlock,
@@ -450,9 +393,7 @@ pub(crate) fn expand(session: &Session, id: PeriodId) -> Result<ExpandedPeriod<'
 /// Renders an expanded period, mapping every glyph path through `glyph`.
 pub(crate) fn render_expanded<E>(
     expanded: &ExpandedPeriod<'_>,
-    session: &Session,
     glyph: &mut dyn FnMut(&GlyphPath) -> Result<String, E>,
-    unknown_symbol: E,
 ) -> Result<Vec<Vec<String>>, E> {
     let mut lines = Vec::with_capacity(expanded.clauses.len());
     for clause in &expanded.clauses {
@@ -467,21 +408,6 @@ pub(crate) fn render_expanded<E>(
             tokens.push(pair.tile.as_str().to_owned());
             let text = match pair.glyph {
                 ExpandedGlyph::Path(path) => glyph(path)?,
-                ExpandedGlyph::Raw(symbol) => {
-                    let Some(content) = session.interner().resolve(symbol) else {
-                        return Err(unknown_symbol);
-                    };
-                    let mut quoted = String::new();
-                    quoted.push(RAW_STRING_QUOTE);
-                    quoted.push_str(content);
-                    quoted.push(RAW_STRING_QUOTE);
-                    quoted
-                }
-                ExpandedGlyph::SemaByGlyph(path) => {
-                    let mut text = glyph(path)?;
-                    text.push_str(SEMA_ANAPHORA_MARK);
-                    text
-                }
                 ExpandedGlyph::SemaLatest => SEMA_ANAPHORA_MARK.to_owned(),
                 ExpandedGlyph::Marker => ANAPHORA_MARK.to_string(),
             };
@@ -506,6 +432,6 @@ pub fn render_expanded_period(session: &Session, id: PeriodId) -> Result<String,
     let mut lexical = |path: &GlyphPath| {
         render_glyph_path(path, interner).map_err(|_| ExpandError::UnknownSymbol)
     };
-    let lines = render_expanded(&expanded, session, &mut lexical, ExpandError::UnknownSymbol)?;
+    let lines = render_expanded(&expanded, &mut lexical)?;
     Ok(join_period(expanded.open, expanded.close, lines))
 }

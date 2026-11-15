@@ -10,7 +10,7 @@
 //! threshold <KEY> cha min:0 max:100        Physical threshold (cha | chu | col)
 //! qualifier <KEY> <K>,<K>                  Allowed `§` qualifiers after root <KEY>
 //! require <KEY> zato|quo                   Mandatory subordinate (conditional | quo)
-//! raw deny | raw allow:<K>,<K>             Enhanced Security (raw labels)
+//! label deny | label allow:<K>,<K>         Enhanced Security (labels, v4.1)
 //! ```
 //! Every rule refers to the **signal glyph** (the glyph of the signal pair, P1),
 //! except `qualifier`, which applies to any glyph path with that root.
@@ -32,7 +32,7 @@ use crate::ast::{
 use crate::dti::{Dti, DtiKey};
 use crate::session::{PeriodId, Session};
 use crate::span::Span;
-use crate::stage3::{resolve_path, IndexedAtom, PathResolution};
+use crate::stage3::{resolve_path, slot_content, IndexedAtom, PathResolution, SlotContent};
 
 const FORMAT_VERSION: &str = "1";
 
@@ -54,11 +54,11 @@ pub enum Requirement {
     Quo,
 }
 
-/// Enhanced Security rule on raw labels.
+/// Enhanced Security rule on labels (v4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RawRule {
+pub enum LabelRule {
     Deny,
-    /// Raw labels allowed only in clauses whose signal glyph is listed.
+    /// Labels allowed only in clauses whose signal glyph is listed.
     Allow(BTreeSet<DtiKey>),
 }
 
@@ -122,7 +122,7 @@ pub struct DtiPolicyManager {
     thresholds: BTreeMap<(DtiKey, Comparative), Range>,
     qualifiers: BTreeMap<DtiKey, BTreeSet<DtiKey>>,
     requires: BTreeMap<DtiKey, Vec<Requirement>>,
-    raw: Option<RawRule>,
+    label: Option<LabelRule>,
     enhanced_security: bool,
 }
 
@@ -227,8 +227,8 @@ pub enum PolicyRule {
         glyph: DtiKey,
         requirement: Requirement,
     },
-    /// Raw label blocked by Enhanced Security.
-    RawLabel,
+    /// Label blocked by Enhanced Security (v4.1).
+    Label,
     /// A glyph that cannot be resolved to a DTI key.
     UnresolvedGlyph,
 }
@@ -357,7 +357,7 @@ impl DtiPolicyManager {
             thresholds: BTreeMap::new(),
             qualifiers: BTreeMap::new(),
             requires: BTreeMap::new(),
-            raw: None,
+            label: None,
             enhanced_security: false,
         };
         let mut rules_started = false;
@@ -471,24 +471,24 @@ impl DtiPolicyManager {
                 list.push(requirement);
                 Ok(())
             }
-            ["raw", rule] => {
-                if self.raw.is_some() {
+            ["label", rule] => {
+                if self.label.is_some() {
                     return Err(PolicyErrorKind::DuplicateRule);
                 }
-                self.raw = Some(if *rule == "deny" {
-                    RawRule::Deny
+                self.label = Some(if *rule == "deny" {
+                    LabelRule::Deny
                 } else {
                     let list = rule
                         .strip_prefix("allow:")
                         .ok_or(PolicyErrorKind::MalformedRule)?;
-                    RawRule::Allow(loader.keys(list)?)
+                    LabelRule::Allow(loader.keys(list)?)
                 });
                 Ok(())
             }
             [kind, ..]
                 if matches!(
                     *kind,
-                    "signal" | "role" | "threshold" | "qualifier" | "require" | "raw"
+                    "signal" | "role" | "threshold" | "qualifier" | "require" | "label"
                 ) =>
             {
                 Err(PolicyErrorKind::MalformedRule)
@@ -497,7 +497,7 @@ impl DtiPolicyManager {
         }
     }
 
-    /// Enables Enhanced Security: without an explicit `raw` rule, raw labels are denied.
+    /// Enables Enhanced Security: without an explicit `label` rule, labels are denied.
     pub fn with_enhanced_security(mut self, enabled: bool) -> Self {
         self.enhanced_security = enabled;
         self
@@ -538,7 +538,8 @@ enum Seen {
         root_qualifiers: Vec<DtiKey>,
     },
     Numeral(u64),
-    Raw,
+    /// A label (v4.1): not a concept.
+    Label,
     /// Structural content that carries no key (numeral with qualifiers).
     Structural,
     Unresolved,
@@ -573,6 +574,14 @@ impl Checker<'_> {
                 let Some(GlyphSlot::Glyph(path)) = self.session.glyph_slot(slot) else {
                     return vec![Seen::Unresolved];
                 };
+                let Some(text) = self.session.interner().resolve(path.text) else {
+                    return vec![Seen::Unresolved];
+                };
+                // A slot marked as a label, or a wire-label token (`LVA…`, e.g.
+                // traffic filtered by the Legacy Shield), is a label.
+                if slot_content(self.session, slot, text) != SlotContent::Glyph {
+                    return vec![Seen::Label];
+                }
                 match resolve_path(path, self.session.interner(), self.dti) {
                     Ok(PathResolution::Record(key)) => vec![Seen::Concept {
                         key,
@@ -603,7 +612,6 @@ impl Checker<'_> {
                     Err(_) => vec![Seen::Unresolved],
                 }
             }
-            SlotValue::Raw(_) => vec![Seen::Raw],
             SlotValue::Variable(binding) => self
                 .session
                 .binding(binding)
@@ -682,9 +690,9 @@ impl Checker<'_> {
         });
 
         // Filter 5 (Enhanced Security) and generic checks on every pair.
-        let raw_allowed = match &self.policy.raw {
-            Some(RawRule::Deny) => false,
-            Some(RawRule::Allow(keys)) => signal_key.is_some_and(|k| keys.contains(&k)),
+        let label_allowed = match &self.policy.label {
+            Some(LabelRule::Deny) => false,
+            Some(LabelRule::Allow(keys)) => signal_key.is_some_and(|k| keys.contains(&k)),
             None => !self.policy.enhanced_security && self.policy.default == PolicyDefault::Allow,
         };
         let pair_count = u32::try_from(block.pair_count()).unwrap_or(0);
@@ -695,7 +703,7 @@ impl Checker<'_> {
             };
             for seen in self.seen(slot.value()) {
                 match seen {
-                    Seen::Raw if !raw_allowed => self.violation(PolicyRule::RawLabel, span),
+                    Seen::Label if !label_allowed => self.violation(PolicyRule::Label, span),
                     Seen::Unresolved => self.violation(PolicyRule::UnresolvedGlyph, span),
                     // Filter 3a: qualifier limits.
                     Seen::Concept {
@@ -716,7 +724,7 @@ impl Checker<'_> {
                             }
                         }
                     }
-                    Seen::Raw | Seen::Numeral(_) | Seen::Structural => {}
+                    Seen::Label | Seen::Numeral(_) | Seen::Structural => {}
                 }
             }
         }

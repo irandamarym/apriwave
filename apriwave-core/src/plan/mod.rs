@@ -17,7 +17,9 @@ use crate::ast::{
 };
 use crate::dti::{Dti, DtiKey};
 use crate::session::{PeriodId, Session};
-use crate::stage3::{resolve_path, IndexedAtom, PathResolution, ResolveError};
+use crate::stage3::{
+    resolve_path, slot_content, IndexedAtom, PathResolution, ResolveError, SlotContent,
+};
 
 /// S2: how the host must treat a target set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -39,7 +41,8 @@ pub struct TargetSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub clause: GlobalClause,
-    /// One 0-based index per enclosing `abdur=<N>` loop, outermost first.
+    /// One 0-based index per enclosing `abdur=<N>` loop, outermost first (the
+    /// loops of one clause nest in written order).
     pub iteration: Box<[u32]>,
     pub targets: Option<TargetSet>,
 }
@@ -61,7 +64,7 @@ pub enum PlanError {
         clause: ClauseId,
         error: ResolveError,
     },
-    /// A set operand is not a concept (raw label, sema, numeral).
+    /// A set operand is not a concept (label, sema, numeral).
     UnsupportedOperand {
         clause: ClauseId,
     },
@@ -138,30 +141,32 @@ impl<'s> Planner<'s> {
         }
     }
 
-    /// `abdur=<N>` count of a clause (at most one loop pair per clause, Q21).
-    fn loop_count(&self, clause: ClauseId) -> Option<u32> {
-        self.block(clause)
-            .and_then(|block| {
-                block
-                    .cases
-                    .iter()
-                    .find_map(|p| p.tile.node.case.loop_count())
-            })
-            .map(|count| count.get())
+    /// `abdur=<N>` counts of a clause in written order (v4.1: several loops in
+    /// one clause nest, the first written outermost: N₁ × N₂ × …).
+    fn loop_counts(&self, clause: ClauseId) -> Vec<u32> {
+        self.block(clause).map_or_else(Vec::new, |block| {
+            block
+                .cases
+                .iter()
+                .filter_map(|p| p.tile.node.case.loop_count())
+                .map(|count| count.get())
+                .collect()
+        })
     }
 
     /// Loop-control subordinate: bare `abdur` marker in a clause with a written
-    /// conditional (validated by stage 2).
+    /// or inherited conditional (validated by stage 2).
     fn is_loop_control(&self, clause: ClauseId) -> bool {
-        self.block(clause).is_some_and(|block| {
-            matches!(
-                block.signal.tile.node.determiners().tense,
-                Some(TemporalMode::Conditional(_))
-            ) && block
-                .cases
-                .iter()
-                .any(|p| p.tile.node.case == Case::Ablative(Some(AblativeDeterminer::Dur(None))))
-        })
+        let conditional = self
+            .analysis(clause)
+            .and_then(ClauseAnalysis::signal)
+            .is_some_and(|signal| matches!(signal.tense, Some(TemporalMode::Conditional(_))));
+        conditional
+            && self.block(clause).is_some_and(|block| {
+                block.cases.iter().any(|p| {
+                    p.tile.node.case == Case::Ablative(Some(AblativeDeterminer::Dur(None)))
+                })
+            })
     }
 
     fn push(&mut self, clause: ClauseId, iteration: &[u32], first: bool) -> Result<(), PlanError> {
@@ -202,19 +207,20 @@ impl<'s> Planner<'s> {
         for child in control {
             self.visit(child, iteration, first)?;
         }
-        let loop_count = self.loop_count(clause);
-        let looping = loop_count.is_some();
-        for round in 0..loop_count.unwrap_or(1) {
-            let first_round = first && round == 0;
-            if looping {
-                iteration.push(round);
-            }
+        let counts = self.loop_counts(clause);
+        // Odometer over the nested loops of the clause (innermost = last written).
+        let mut rounds: Vec<u32> = vec![0; counts.len()];
+        let outer = iteration.len();
+        loop {
+            let first_round = first && rounds.iter().all(|round| *round == 0);
+            iteration.extend_from_slice(&rounds);
             self.push(clause, iteration, first_round)?;
             for child in &body {
                 self.visit(*child, iteration, first_round)?;
             }
-            if looping {
-                iteration.pop();
+            iteration.truncate(outer);
+            if !advance(&mut rounds, &counts) {
+                break;
             }
         }
         Ok(())
@@ -227,6 +233,15 @@ impl<'s> Planner<'s> {
                 let Some(GlyphSlot::Glyph(path)) = self.session.glyph_slot(slot) else {
                     return Err(PlanError::UnsupportedOperand { clause });
                 };
+                let text = self
+                    .session
+                    .interner()
+                    .resolve(path.text)
+                    .ok_or(PlanError::UnsupportedOperand { clause })?;
+                // A label is not a concept (v4.1).
+                if slot_content(self.session, slot, text) != SlotContent::Glyph {
+                    return Err(PlanError::UnsupportedOperand { clause });
+                }
                 match resolve_path(path, self.session.interner(), self.dti)
                     .map_err(|error| PlanError::Resolve { clause, error })?
                 {
@@ -253,7 +268,7 @@ impl<'s> Planner<'s> {
                 }
                 Ok(keys)
             }
-            SlotValue::Raw(_) | SlotValue::Sema(_) => Err(PlanError::UnsupportedOperand { clause }),
+            SlotValue::Sema(_) => Err(PlanError::UnsupportedOperand { clause }),
         }
     }
 
@@ -374,6 +389,19 @@ impl<'s> Planner<'s> {
             keys: result.into_iter().collect(),
         }))
     }
+}
+
+/// Advances the odometer `rounds` (one digit per loop, bounded by `counts`);
+/// `false` once every combination has been produced.
+fn advance(rounds: &mut [u32], counts: &[u32]) -> bool {
+    for (round, count) in rounds.iter_mut().zip(counts).rev() {
+        *round = round.saturating_add(1);
+        if *round < *count {
+            return true;
+        }
+        *round = 0;
+    }
+    false
 }
 
 /// Builds the execution plan of a period: relational clauses in tree pre-order

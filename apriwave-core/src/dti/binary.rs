@@ -25,9 +25,11 @@
 //! - universal: keys, primary forms (`str`), display forms (`opt str`),
 //!   synonyms (`list str`), base/param (`opt key`, `opt key`), morph flags
 //!   (`u8`), superseded_by (`opt key`), attributes (`list (str, str)`);
-//! - local: record kinds (`u8`: `0` = `use`, `1` = `new`), keys, forms
-//!   (`opt str`: `form:` of `use`, primary of `new`), display forms
-//!   (`opt str`), synonyms (`list str`), base (`opt key`), morph flags (`u8`).
+//! - local: record kinds (`u8`: `0` = `use`, `1` = `new`, `2` = `label`), keys,
+//!   forms (`opt str`: `form:` of `use`, primary of `new`, form of `label`),
+//!   display forms (`opt str`), synonyms (`list str`), base (`opt key`), morph
+//!   flags (`u8`). Label records (format version 2, v4.1) follow the concept
+//!   records, in key order.
 //!
 //! Encodings: `key` = 32 ASCII bytes; `str` = `u32` byte length + UTF-8;
 //! `opt T` = `u8` tag (`0` absent, `1` present) + `T`; `list T` = `u32` count +
@@ -68,7 +70,7 @@ use super::parse::{
 /// Magic bytes at the start of every `.dti.bin` file.
 pub const BINARY_MAGIC: [u8; 8] = *b"AWDTIBIN";
 /// Current binary format version.
-pub const BINARY_FORMAT_VERSION: u32 = 1;
+pub const BINARY_FORMAT_VERSION: u32 = 2;
 /// Maximum accepted size of a binary (resource limit). Binaries may be
 /// slightly larger than their source (length prefixes), hence the margin.
 pub const MAX_BINARY_BYTES: usize = MAX_SOURCE_BYTES.saturating_mul(4);
@@ -77,6 +79,7 @@ const KIND_UNIVERSAL: u8 = 0;
 const KIND_LOCAL: u8 = 1;
 const RECORD_USE: u8 = 0;
 const RECORD_NEW: u8 = 1;
+const RECORD_LABEL: u8 = 2;
 const MORPH_AGGL: u8 = 1;
 const MORPH_CONTR: u8 = 2;
 const MORPH_UNION: u8 = 4;
@@ -720,12 +723,14 @@ impl LocalOverlay {
         let order: Vec<&DtiKey> = ordered(&keys, &self.lexicon).collect();
         let entries: Vec<_> = order.iter().map(|k| self.lexicon.entry(k)).collect();
         let concepts: Vec<_> = order.iter().map(|k| self.local.get(k)).collect();
+        // Label records follow the concept records, in key order (v4.1).
+        let labels: Vec<(DtiKey, &str)> = self.labels.iter().collect();
 
         let mut w = Writer::header(KIND_LOCAL, source_hash);
         w.u64(self.universal_version);
         w.str(&self.language);
         w.u8(policy_code(self.policy));
-        w.len(order.len());
+        w.len(order.len().saturating_add(labels.len()));
         for concept in &concepts {
             w.u8(if concept.is_some() {
                 RECORD_NEW
@@ -733,23 +738,44 @@ impl LocalOverlay {
                 RECORD_USE
             });
         }
+        for _ in &labels {
+            w.u8(RECORD_LABEL);
+        }
         for key in &order {
+            w.key(key);
+        }
+        for (key, _) in &labels {
             w.key(key);
         }
         for entry in &entries {
             w.opt_str(entry.map(|e| &*e.primary));
         }
+        for (_, form) in &labels {
+            w.opt_str(Some(form));
+        }
         for entry in &entries {
             w.opt_str(entry.and_then(|e| e.display.as_deref()));
+        }
+        for _ in &labels {
+            w.opt_str(None);
         }
         for entry in &entries {
             w.strs(entry.map_or(&[], |e| &*e.synonyms));
         }
+        for _ in &labels {
+            w.strs(&[]);
+        }
         for concept in &concepts {
             w.opt_key(concept.and_then(|c| c.base.as_ref()));
         }
+        for _ in &labels {
+            w.opt_key(None);
+        }
         for concept in &concepts {
             w.morph(concept.map(|c| c.morph).unwrap_or_default());
+        }
+        for _ in &labels {
+            w.morph(MorphFlags::default());
         }
         w.out
     }
@@ -782,6 +808,7 @@ impl LocalOverlay {
             match r.u8()? {
                 RECORD_USE => Ok(RecordKind::Use),
                 RECORD_NEW => Ok(RecordKind::New),
+                RECORD_LABEL => Ok(RecordKind::Label),
                 _ => Err(DtiLoadError::Malformed {
                     offset,
                     what: "unknown record kind",
@@ -821,10 +848,13 @@ impl LocalOverlay {
             .zip(morphs)
             .enumerate();
         for (index, ((((((kind, key), form), display), syns), base), morph)) in rows {
-            // `use`: the column holds the local `form:`; `new`: the primary form.
+            // `use`: the column holds the local `form:`; `new` / `label`: the
+            // primary form.
             let (primary, form) = match kind {
                 RecordKind::Use => (None, form.map(Box::from)),
-                RecordKind::New | RecordKind::Rec => (form.map(Box::from), None),
+                RecordKind::New | RecordKind::Rec | RecordKind::Label => {
+                    (form.map(Box::from), None)
+                }
             };
             let record = RawRecord {
                 line: ordinal(index),

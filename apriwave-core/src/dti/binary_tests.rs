@@ -5,8 +5,8 @@ use alloc::collections::{BTreeMap, BTreeSet};
 
 use super::super::{
     fnv1a_64, load_or_compile_local, load_or_compile_universal, ConceptRecord, Dti, DtiDiagnostic,
-    DtiErrorKind, DtiKey, DtiLoadError, DtiSource, LexicalEntry, Lexicon, LocalOverlay, MorphFlags,
-    UniversalSnapshot, UnknownKeyPolicy,
+    DtiErrorKind, DtiKey, DtiLoadError, DtiSource, LabelLexicon, LexicalEntry, Lexicon,
+    LocalOverlay, MorphFlags, UniversalSnapshot, UnknownKeyPolicy,
 };
 
 type TestResult = Result<(), String>;
@@ -76,6 +76,7 @@ fn local_source(universal_version: u64) -> Result<String, String> {
         k("localsensor")?,
         k("alamp")?,
     );
+    let (roma, verde, green_label) = (k("labelroma")?, k("blabelverde")?, k("labelgreen")?);
     Ok(format!(
         "#awdti 1\n#role local\n#universal {universal_version}\n#lang it\n#policy reject\n\
 use {green} form:verde\n\
@@ -85,7 +86,10 @@ new {sensor} sensoreluce base:{door} display:\"sensore luce\" syn:uscio morph:+C
 use {carry} form:portare syn:uscio\n\
 use {digit0}\n\
 use {digit1}\n\
-new {lamp} lampada base:{sensor}\n"
+new {lamp} lampada base:{sensor}\n\
+label {roma} Roma\n\
+label {verde} verde\n\
+label {green_label} green\n"
     ))
 }
 
@@ -185,7 +189,20 @@ fn local_round_trip_preserves_the_model() -> TestResult {
         "uscio order",
         decoded.lexicon().synonyms("uscio"),
         [key("door")?, key("localsensor")?, key("carry")?].as_slice(),
-    )
+    )?;
+    // v4.1: labels survive the round trip, census warnings are recomputed.
+    check("labels", decoded.labels().len(), 3)?;
+    check(
+        "label verde",
+        decoded.labels().key("verde"),
+        Some(key("blabelverde")?),
+    )?;
+    check(
+        "census warnings",
+        decoded.census_warnings().len(),
+        overlay.census_warnings().len(),
+    )?;
+    check("one census warning", overlay.census_warnings().len(), 1)
 }
 
 #[test]
@@ -482,14 +499,14 @@ fn invalid(kind: DtiErrorKind, source: DtiSource, line: u32) -> DtiLoadError {
 #[test]
 fn decoder_applies_the_shared_model_invariants() -> TestResult {
     let (a, b, c) = (key("aa")?, key("bb")?, key("cc")?);
-    // Atomic forms: `§` is refused in a primary form (QualifiedForm).
+    // Forms: the anaphora operator is refused (v4.1: `§` is allowed).
     expect_error(
-        "qualified primary",
+        "operator as primary",
         UniversalSnapshot::from_binary(&raw_universal(vec![(
             concept(a, None, None),
-            entry(a, "verde§smeraldo"),
+            entry(a, "~~"),
         )])),
-        &invalid(DtiErrorKind::QualifiedForm, DtiSource::Universal, 1),
+        &invalid(DtiErrorKind::InvalidForm, DtiSource::Universal, 1),
     )?;
     // References must exist.
     expect_error(
@@ -536,6 +553,8 @@ fn decoder_applies_the_shared_model_invariants() -> TestResult {
         enabled,
         local: BTreeMap::new(),
         lexicon: Lexicon::default(),
+        labels: LabelLexicon::default(),
+        census_warnings: Vec::new(),
     }
     .to_binary(0);
     expect_error(
@@ -561,6 +580,8 @@ fn decoder_applies_the_shared_model_invariants() -> TestResult {
         enabled: BTreeSet::new(),
         local,
         lexicon,
+        labels: LabelLexicon::default(),
+        census_warnings: Vec::new(),
     }
     .to_binary(0);
     expect_error(

@@ -246,16 +246,18 @@ fn signal_variants_roundtrip() -> TestResult {
     ] {
         roundtrip(&format!("/^ ta p : {sig} x nu y ^/"))?;
     }
-    // A comparative requires an Accusative (Q19); ref and a comparative together are
-    // therefore always incompatible (ref forbids the Accusative).
-    for sig in ["taallchaato", "tosomecuozasu", "quatacolalt", "deepcup"] {
+    // A comparative requires an Accusative (Q19). v4.1: `ref` admits the
+    // Accusative, so `ref` and a comparative combine freely.
+    for sig in [
+        "taallchaato",
+        "tosomecuozasu",
+        "quatacolalt",
+        "deepcup",
+        "taallrefchaato",
+        "tarefcha",
+    ] {
         roundtrip(&format!("/^ ta p : {sig} x nu y a z ^/"))?;
     }
-    expect(
-        "/^ taallrefchaato x nu y a z ^/",
-        DiagnosticKind::AccusativeInReflexive,
-        ErrorCode::Syntax,
-    )?;
     roundtrip("/^ def x a y ^/")?;
     roundtrip("/^ defu x au y ^/")?;
     roundtrip("/^ defm x am y ^/")?;
@@ -264,6 +266,7 @@ fn signal_variants_roundtrip() -> TestResult {
 
 #[test]
 fn glyph_slot_variants_roundtrip() -> TestResult {
+    // v4.1: `video~`, `video§rosso~` and `vedere~~` are ordinary glyphs.
     roundtrip("/^ ta rilevare nu sonda au video§rosso : ta archiviare nu io au video~ ^/")?;
     roundtrip("/^ ta rilevare nu sonda au video : ta allarme nu io au video§rosso~ ^/")?;
     roundtrip("/^ ta vedere nu io au canis : ta abbaiare nu ~ : ta vedere~~ ^/")?;
@@ -422,17 +425,12 @@ fn determiner_order_errors() -> TestResult {
 // ═══════════════════ ERR_SYNTAX ═══════════════════
 
 #[test]
-fn reflexive_forbids_accusative() -> TestResult {
-    expect(
-        "/^ taref observe nu io au te ^/",
-        DiagnosticKind::AccusativeInReflexive,
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ taref observe nu io anum te ^/",
-        DiagnosticKind::AccusativeInReflexive,
-        ErrorCode::Syntax,
-    )
+fn reflexive_admits_accusative() -> TestResult {
+    // v4.1: indirect / transitive reflexive ("the node updates its firmware").
+    roundtrip("/^ taref observe nu io au te ^/")?;
+    roundtrip("/^ taref observe nu io anum te ^/")?;
+    // Inherited `ref` with an Accusative in the subordinate.
+    roundtrip("/^ taref aggiornare nu nodo : ta scaricare a firmware ^/")
 }
 
 #[test]
@@ -506,14 +504,21 @@ fn case_syntax_errors() -> TestResult {
 
 #[test]
 fn missing_glyph_and_structure() -> TestResult {
+    // v4.1 Slot Locking: `^/` and `:` in an even slot are glyphs, so a glyph is
+    // missing only at the end of the input.
     expect(
-        "/^ ta ^/",
+        "/^ ta",
         DiagnosticKind::SignalTileWithoutGlyph,
         ErrorCode::Syntax,
     )?;
     expect(
+        "/^ ta ^/",
+        DiagnosticKind::MissingPeriodClose,
+        ErrorCode::Syntax,
+    )?;
+    expect(
         "/^ ta : tazato a ^/",
-        DiagnosticKind::SignalTileWithoutGlyph,
+        DiagnosticKind::UnknownCaseTile,
         ErrorCode::Syntax,
     )?;
     expect(
@@ -589,80 +594,57 @@ fn whitespace_must_be_canonical() -> TestResult {
 }
 
 #[test]
-fn glyph_syntax_errors() -> TestResult {
-    let malformed = |fault| DiagnosticKind::MalformedGlyph { fault };
+fn glyph_free_characters() -> TestResult {
+    // v4.1: any visible character in a glyph (Slot Locking decides the role).
+    for glyph in [
+        "x§", "§x", "x§§y", "§", "x-y", "x_y", "a~b", "~~~", "x.y", "Canis", "\"ab", "\"",
+        "\"a\"b\"", "^/", "^^/", "/^/", "/^", ":", "::", "東京", "Ω§β", "x~", "(a|b)",
+    ] {
+        roundtrip(&format!("/^ ta {glyph} nu y ^/"))?;
+    }
+    // Tiles keep their own character rules.
     expect(
-        "/^ ta x§ ^/",
-        malformed(GlyphFault::EmptySegment),
+        "/^ Ta x ^/",
+        DiagnosticKind::UppercaseCharacter { ch: 'T' },
+        ErrorCode::Syntax,
+    )
+}
+
+#[test]
+fn glyph_invisible_characters_d9() -> TestResult {
+    let invisible = |ch| DiagnosticKind::MalformedGlyph {
+        fault: GlyphFault::InvisibleCharacter { ch },
+    };
+    expect(
+        "/^ ta x\u{202E}y ^/",
+        invisible('\u{202E}'),
         ErrorCode::Syntax,
     )?;
     expect(
-        "/^ ta §x ^/",
-        malformed(GlyphFault::EmptySegment),
+        "/^ ta x\u{200B} ^/",
+        invisible('\u{200B}'),
         ErrorCode::Syntax,
     )?;
     expect(
-        "/^ ta x§§y ^/",
-        malformed(GlyphFault::EmptySegment),
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ ta x-y ^/",
-        malformed(GlyphFault::IllegalCharacter { ch: '-' }),
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ ta x_y ^/",
-        malformed(GlyphFault::IllegalCharacter { ch: '_' }),
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ ta a~b ^/",
-        malformed(GlyphFault::IllegalCharacter { ch: '~' }),
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ ta ~~~ ^/",
-        malformed(GlyphFault::IllegalCharacter { ch: '~' }),
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ ta x.y ^/",
-        DiagnosticKind::ForbiddenSeparator { ch: '.' },
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ ta Canis ^/",
-        DiagnosticKind::UppercaseCharacter { ch: 'C' },
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ ta \"ab ^/",
-        malformed(GlyphFault::UnterminatedRawString),
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ ta \" ^/",
-        malformed(GlyphFault::UnterminatedRawString),
-        ErrorCode::Syntax,
-    )?;
-    expect(
-        "/^ ta \"a\"b\" ^/",
-        malformed(GlyphFault::QuoteInsideRawString),
+        "/^ ta \u{0007}x ^/",
+        invisible('\u{0007}'),
         ErrorCode::Syntax,
     )
 }
 
 #[test]
 fn def_constraints_q11() -> TestResult {
+    // v4.1: the variable name is the whole glyph token.
+    roundtrip("/^ defu x§y a z ^/")?;
+    roundtrip("/^ defu X-1 a z ^/")?;
     expect(
-        "/^ defu x§y a z ^/",
-        DiagnosticKind::DefNameNotAtomic,
+        "/^ defu ~ a z ^/",
+        DiagnosticKind::DefNameNotAGlyph,
         ErrorCode::Syntax,
     )?;
     expect(
-        "/^ defu ~ a z ^/",
-        DiagnosticKind::DefNameNotAtomic,
+        "/^ defu ~~ a z ^/",
+        DiagnosticKind::DefNameNotAGlyph,
         ErrorCode::Syntax,
     )?;
     expect(
@@ -721,9 +703,15 @@ fn portability_constraints_q6() -> TestResult {
         ErrorCode::Syntax,
     )?;
     expect(
-        "/^ ta x : rel p~~ ^/",
+        "/^ ta x : anchor ~~ ^/",
         DiagnosticKind::PortabilityOperandInvalid,
         ErrorCode::Syntax,
+    )?;
+    // v4.1: `p~~` is an ordinary glyph id (here never opened).
+    expect(
+        "/^ ta x : rel p~~ ^/",
+        DiagnosticKind::UnknownAnchor,
+        ErrorCode::Reference,
     )?;
     expect(
         "/^ ta x : anchor p nu z ^/",
@@ -798,15 +786,17 @@ fn dsp_depth_limit_q13() -> TestResult {
 
 #[test]
 fn case_without_glyph() -> TestResult {
+    // v4.1 Slot Locking: the token after a case tile is always its glyph.
+    roundtrip("/^ ta vedere nu ^/ ^/")?;
     expect(
         "/^ ta vedere nu ^/",
-        DiagnosticKind::CaseTileWithoutGlyph,
-        ErrorCode::CaseAmbiguity,
+        DiagnosticKind::MissingPeriodClose,
+        ErrorCode::Syntax,
     )?;
     expect(
         "/^ ta vedere nu : ta x ^/",
-        DiagnosticKind::CaseTileWithoutGlyph,
-        ErrorCode::CaseAmbiguity,
+        DiagnosticKind::UnknownCaseTile,
+        ErrorCode::Syntax,
     )?;
     expect(
         "/^ ta vedere nu",
@@ -816,23 +806,11 @@ fn case_without_glyph() -> TestResult {
 }
 
 #[test]
-fn duplicate_cases_q21() -> TestResult {
-    expect(
-        "/^ ta x nu y n z ^/",
-        DiagnosticKind::DuplicateCase,
-        ErrorCode::CaseAmbiguity,
-    )?;
-    expect(
-        "/^ ta x a y au z ^/",
-        DiagnosticKind::DuplicateCase,
-        ErrorCode::CaseAmbiguity,
-    )?;
-    expect(
-        "/^ defu x a y au z ^/",
-        DiagnosticKind::DuplicateCase,
-        ErrorCode::CaseAmbiguity,
-    )?;
-    // Cases distinguished by determiner, and multiple `absi`, are allowed.
+fn repeated_cases_allowed() -> TestResult {
+    // v4.1: the same case may appear several times in a block.
+    roundtrip("/^ ta x nu y n z ^/")?;
+    roundtrip("/^ ta x a y au z ^/")?;
+    roundtrip("/^ ta x du a du b du c ^/")?;
     roundtrip("/^ ta x ab y aben z abel w ^/")?;
     roundtrip("/^ ta x absi y absi z ^/")
 }
@@ -856,13 +834,13 @@ fn rejected_input_leaves_session_untouched() -> TestResult {
 fn recovery_collects_all_diagnostics_in_order_q25() -> TestResult {
     let diagnostics = reject_in(
         &mut Session::new(),
-        "/^ tarefall x : ta y nu : Ta z ^/ /^ ta w x§ ^/",
+        "/^ tarefall x : ta y nu z : Ta z ^/ /^ ta w nu",
     )?;
     let codes: Vec<ErrorCode> = diagnostics.iter().map(Diagnostic::code).collect();
     let expected = vec![
         ErrorCode::Order,
-        ErrorCode::CaseAmbiguity,
         ErrorCode::Syntax,
+        ErrorCode::CaseAmbiguity,
         ErrorCode::Syntax,
     ];
     if codes != expected {

@@ -4,30 +4,52 @@
 //! [`crate::Session::ingest`]. The protocol grammar is unchanged: the output
 //! uses single ASCII spaces and keeps Slot Locking `[Tile] [Glyph]`.
 //!
-//! Token classification mirrors the positional parser: after a period open or
-//! a connector comes a signal tile (odd slot), then a glyph (even slot), then
-//! case tiles / connectors / closes (odd) alternating with glyphs (even).
-//! Conjunctions and case tiles are recognized only in odd slots.
+//! Token classification mirrors the positional parser (Slot Locking, v4.1):
+//! after a period open or a connector comes a signal tile (odd slot), then a
+//! glyph (even slot), then case tiles / connectors / closes (odd) alternating
+//! with glyphs (even). Every token of an even slot is a glyph — period
+//! delimiters, colon runs, braces and `"` included — except the two exact
+//! anaphora operators `~` and `~~`. Conjunctions and case tiles are recognized
+//! only in odd slots.
 //!
 //! Decision E (option 1): the canonical text admits only DTI **primary forms**.
-//! With a DTI, every glyph atom written as a synonym (`syn:`) or a display form
-//! is replaced by the primary form of its concept, uniformly in every glyph
-//! position: signal and case slots, `def` names and values, portability ids,
-//! the atoms of anaphora bases (`base~`, `base§mod~`, `glyph~~`) and every `§`
-//! segment of a qualified path. Multiword display forms (Normal slots only) are
-//! resolved to the primary form as well. Stage 3 resolves primary forms only.
+//! With a DTI, every glyph written as a synonym (`syn:`) or a display form is
+//! replaced by the primary form of its concept, uniformly in every glyph
+//! position: signal and case slots, `def` names and values, portability ids.
+//! The whole token is looked up first (a DTI form may contain `§`); otherwise
+//! every `§` segment is normalized on its own. Multiword display forms (Normal
+//! slots only) are resolved to the primary form as well. Stage 3 resolves
+//! primary forms only.
+//!
+//! Glyph / Label choice (v4.1): for every form that the local DTI holds as a
+//! label the user must select **Glyph** or **Label** in the editor; the editor
+//! passes the choices ([`SlotChoice`]) to [`preprocess_with_choices`]. A slot
+//! marked as a label is an inert string, never touched by the preprocessor
+//! (no normalization, no multiword, no glyph check): its content is irrelevant
+//! to the protocol, even if two identical labels denote different real-world
+//! objects. A slot marked as a glyph, or left unmarked, follows the DTI rules.
+//!
+//! DTI check (v4.1): every glyph token of a Normal slot is checked against the
+//! DTI, also when Slot Locking turned a period delimiter or a colon run into a
+//! glyph (`/^ ta vedere nu ^/`): a token that is not censused produces
+//! [`AssistNote::UnknownGlyph`] (with `structural` set for such tokens), so
+//! that the editor asks the user to census it as a glyph or as a label, besides
+//! the missing period close reported by the session.
 
 use std::fmt;
 
+use crate::analyze::{ClauseId, GlobalClause, SlotIndex, SlotRef};
+use crate::ast::{ClauseRef, DefOperation};
 use crate::ast::{
     Comparative, Conditional, DefSignal, ExplicitNumber, PrimarySignal, Quantifier, Reflexive,
-    SecondarySignal, Temporal, ANAPHORA_MARK, DEEP_SURFACE, QUALIFIER_SEPARATOR, RAW_STRING_QUOTE,
+    SecondarySignal, Temporal, ANAPHORA_MARK, DEEP_SURFACE, QUALIFIER_SEPARATOR,
     SEMA_ANAPHORA_MARK,
 };
 use crate::dti::{Dti, DtiKey, FormResolution};
 use crate::error::DiagnosticKind;
+use crate::session::{PeriodId, Session, SlotKind};
 use crate::span::Span;
-use crate::stage3::{resolve_glyph_text, MorphFlag, ResolveError};
+use crate::stage3::{is_glyph_form, resolve_glyph_text, MorphFlag, ResolveError};
 use crate::tiles::{self, SignalParse};
 
 /// Maximum number of tokens joined into a multiword display form.
@@ -69,18 +91,44 @@ pub struct AssistOutput {
     /// Canonical protocol text (single ASCII spaces, no comments).
     pub text: String,
     pub notes: Vec<AssistNote>,
+    /// Byte spans, in [`AssistOutput::text`], of the tokens the user marked as
+    /// labels: pass them to [`apply_label_choices`] after ingesting `text`.
+    pub labels: Vec<Span>,
+}
+
+/// Glyph / Label selection of the user for one even-slot token (v4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotChoice {
+    /// Byte span of the token in the editor input.
+    pub span: Span,
+    pub kind: SlotKind,
 }
 
 /// Non-fatal information for the editor.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AssistNote {
-    /// A single glyph whose form is unknown to the DTI. The editor may offer
-    /// to reclassify it as a raw-string label (`label_suggestion`, if valid).
+    /// A glyph token that is not censused in the DTI (v4.1: neither a glyph
+    /// nor, when unmarked, a label). The editor highlights it as not censused
+    /// and asks the user to census it in the local DTI as a glyph (`new`) or as
+    /// a label (`label <KEY> <form>`). `structural` is set when the token is
+    /// also a period delimiter or a colon run that Slot Locking placed in an
+    /// even slot (the session also reports the missing period close).
     UnknownGlyph {
         token: String,
         span: Span,
-        label_suggestion: Option<String>,
+        structural: bool,
     },
+    /// A token marked as a label that is not censused as a label of the local
+    /// DTI: the editor asks the user to census it (`label <KEY> <form>`).
+    UncensusedLabel { token: String, span: Span },
+    /// An unmarked form that the local DTI holds only as a label (v4.1): the
+    /// selection is mandatory, the editor asks the user to confirm **Label**
+    /// (or **Glyph**) and passes the choice as a [`SlotChoice`].
+    Label { token: String, span: Span },
+    /// An unmarked form that the local DTI holds both as a glyph and as a label
+    /// (v4.1): the editor opens the mandatory Glyph / Label menu and passes the
+    /// choice as a [`SlotChoice`].
+    GlyphOrLabel { token: String, span: Span },
     /// A multiword display form replaced by the primary form of its key.
     MultiwordGlyph {
         phrase: String,
@@ -187,67 +235,6 @@ impl fmt::Display for AssistDiagnosticKind {
     }
 }
 
-/// Reasons why a token cannot become a raw-string label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LabelError {
-    Empty,
-    ContainsQuote,
-    ContainsWhitespace,
-    /// Control or bidi/format character (D9).
-    ForbiddenCharacter {
-        ch: char,
-    },
-}
-
-impl fmt::Display for LabelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => f.write_str("empty label"),
-            Self::ContainsQuote => f.write_str("a label cannot contain '\"'"),
-            Self::ContainsWhitespace => f.write_str("a label cannot contain whitespace"),
-            Self::ForbiddenCharacter { ch } => {
-                write!(f, "forbidden character U+{:04X} in label", u32::from(*ch))
-            }
-        }
-    }
-}
-
-impl std::error::Error for LabelError {}
-
-/// D9: control characters plus format characters that alter the direction or
-/// visibility of text.
-fn is_forbidden_label_character(ch: char) -> bool {
-    ch.is_control()
-        || matches!(
-            ch,
-            '\u{061C}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{FEFF}'
-        )
-}
-
-/// Wraps an unknown glyph as a raw-string label `"token"`.
-pub fn reclassify_as_label(token: &str) -> Result<String, LabelError> {
-    if token.is_empty() {
-        return Err(LabelError::Empty);
-    }
-    for ch in token.chars() {
-        if ch == '"' {
-            return Err(LabelError::ContainsQuote);
-        }
-        if ch.is_whitespace() {
-            return Err(LabelError::ContainsWhitespace);
-        }
-        if is_forbidden_label_character(ch) {
-            return Err(LabelError::ForbiddenCharacter { ch });
-        }
-    }
-    Ok(format!("\"{token}\""))
-}
-
 // ═══════════════════════════ Tokenizer ═══════════════════════════
 
 #[derive(Debug, Clone, Copy)]
@@ -271,15 +258,14 @@ fn span_of(start: usize, end: usize) -> Span {
     Span::new(offset(start), offset(end))
 }
 
-/// Splits on any whitespace and drops `//` comments. A `"` toggles the raw
-/// string state inside a token (`"http://x"` is not a comment); a `/` that
-/// follows `^` belongs to a period delimiter (`/^/`, `^/`, `^^/`).
+/// Splits on any whitespace and drops `//` comments. A comment starts at the
+/// beginning of a token or right after a complete period delimiter
+/// (`^/// note`); v4.1: `"` is an ordinary character, so `//` inside any other
+/// token belongs to it (a glyph such as `http://x` keeps its `//`).
 fn tokenize<'a>(input: &'a str, comments: bool) -> Vec<Token<'a>> {
     let mut tokens = Vec::new();
     let mut chars = input.char_indices().peekable();
     let mut token_start: Option<usize> = None;
-    let mut in_quote = false;
-    let mut previous: Option<char> = None;
     let mut in_comment = false;
 
     let push = |tokens: &mut Vec<Token<'a>>, start: usize, end: usize| {
@@ -299,35 +285,33 @@ fn tokenize<'a>(input: &'a str, comments: bool) -> Vec<Token<'a>> {
             if let Some(start) = token_start.take() {
                 push(&mut tokens, start, index);
             }
-            in_quote = false;
-            previous = None;
             continue;
         }
-        if ch == '"' {
-            in_quote = !in_quote;
-        } else if comments
-            && !in_quote
-            && ch == '/'
-            && previous != Some('^')
-            && matches!(chars.peek(), Some((_, '/')))
-        {
-            if let Some(start) = token_start.take() {
-                push(&mut tokens, start, index);
+        if comments && ch == '/' && matches!(chars.peek(), Some((_, '/'))) {
+            let so_far = token_start.and_then(|start| input.get(start..index));
+            let after_delimiter = so_far.is_some_and(|text| {
+                is_period_delimiter(text) && !is_period_delimiter(&format!("{text}/"))
+            });
+            if so_far.is_none() || after_delimiter {
+                if let Some(start) = token_start.take() {
+                    push(&mut tokens, start, index);
+                }
+                in_comment = true;
+                continue;
             }
-            in_comment = true;
-            in_quote = false;
-            previous = None;
-            continue;
         }
         if token_start.is_none() {
             token_start = Some(index);
         }
-        previous = Some(ch);
     }
     if let Some(start) = token_start {
         push(&mut tokens, start, input.len());
     }
     tokens
+}
+
+fn is_period_delimiter(text: &str) -> bool {
+    tiles::period_open(text).is_some() || tiles::period_close(text).is_some()
 }
 
 // ═══════════════════════════ Signal trains ═══════════════════════════
@@ -504,15 +488,32 @@ struct Assist<'a, 's> {
     next_depth: usize,
     /// The clause being written is a portability block.
     last_portability: bool,
+    /// Glyph / Label selections of the user.
+    choices: &'s [SlotChoice],
+    /// Indices in `out` of the tokens marked as labels.
+    label_tokens: Vec<usize>,
 }
 
-/// Preprocesses assisted input into canonical protocol text.
+/// Preprocesses assisted input into canonical protocol text, without Glyph /
+/// Label selections (every slot is a glyph).
 ///
 /// `Err` carries **all** the blocking diagnostics, in input order.
 pub fn preprocess_assisted_input(
     input: &str,
     settings: &AssistSettings,
     dti: Option<&Dti>,
+) -> Result<AssistOutput, Vec<AssistDiagnostic>> {
+    preprocess_with_choices(input, settings, dti, &[])
+}
+
+/// Preprocesses assisted input with the Glyph / Label selections of the user
+/// (v4.1). Tokens marked as labels stay untouched and are listed in
+/// [`AssistOutput::labels`].
+pub fn preprocess_with_choices(
+    input: &str,
+    settings: &AssistSettings,
+    dti: Option<&Dti>,
+    choices: &[SlotChoice],
 ) -> Result<AssistOutput, Vec<AssistDiagnostic>> {
     let mut assist = Assist {
         settings,
@@ -526,12 +527,24 @@ pub fn preprocess_assisted_input(
         clause_depth: 0,
         next_depth: 0,
         last_portability: false,
+        choices,
+        label_tokens: Vec::new(),
     };
     assist.run();
     if assist.diagnostics.is_empty() {
+        let mut labels = Vec::with_capacity(assist.label_tokens.len());
+        let mut offset: usize = 0;
+        for (index, token) in assist.out.iter().enumerate() {
+            let end = offset.saturating_add(token.len());
+            if assist.label_tokens.contains(&index) {
+                labels.push(span_of(offset, end));
+            }
+            offset = end.saturating_add(1);
+        }
         Ok(AssistOutput {
             text: assist.out.join(" "),
             notes: assist.notes,
+            labels,
         })
     } else {
         assist
@@ -572,6 +585,10 @@ impl Assist<'_, '_> {
     /// Processes one token; returns the number of **extra** tokens consumed.
     fn step(&mut self, token: Token<'_>, index: usize) -> usize {
         let text = token.text;
+        // Slot Locking: every token of an even slot is a glyph.
+        if let State::Glyph(role) = self.state {
+            return self.glyph_slot(index, role);
+        }
         if self.settings.braces {
             if text == OPEN_BRACE {
                 self.open_brace(token.span());
@@ -841,6 +858,25 @@ impl Assist<'_, '_> {
         self.state = State::AfterPair {
             closed_brace: false,
         };
+        let choice = self
+            .choices
+            .iter()
+            .find(|c| c.span == token.span())
+            .map(|c| c.kind);
+        if choice == Some(SlotKind::Label) {
+            // Inert string: never normalized nor resolved.
+            if let Some(dti) = self.dti {
+                if dti.label(token.text).is_none() {
+                    self.notes.push(AssistNote::UncensusedLabel {
+                        token: token.text.to_owned(),
+                        span: token.span(),
+                    });
+                }
+            }
+            self.label_tokens.push(self.out.len());
+            self.out.push(token.text.to_owned());
+            return 0;
+        }
         if role == GlyphRole::Normal {
             if let Some(extra) = self.try_multiword(index) {
                 return extra;
@@ -848,34 +884,31 @@ impl Assist<'_, '_> {
         }
         let text = self.normalize_glyph(token);
         if role == GlyphRole::Normal {
-            self.check_unknown(token, &text);
+            self.check_unknown(token, &text, choice.is_some());
         }
         self.out.push(text);
         0
     }
 
-    /// Normalizes every DTI atom of an even-slot token into its primary form:
-    /// the atoms of a qualified path (`a§b`), of a glyph anaphora base
-    /// (`base~`, `base§mod~`) and of a semantic anaphora (`glyph~~`). Raw
-    /// labels, the bare marks `~` / `~~` and reserved tokens are unchanged.
+    /// Normalizes an even-slot token into its primary form: the whole token
+    /// first (DTI priority, a form may contain `§`), otherwise every `§`
+    /// segment on its own. Labels of the local DTI and the exact operators
+    /// `~` / `~~` are unchanged.
     fn normalize_glyph(&mut self, token: Token<'_>) -> String {
         let text = token.text;
-        if self.dti.is_none()
-            || text.starts_with(RAW_STRING_QUOTE)
-            || text == SEMA_ANAPHORA_MARK
-            || text.strip_prefix(ANAPHORA_MARK) == Some("")
-            || tiles::is_reserved(text)
-        {
+        let Some(dti) = self.dti else {
+            return text.to_owned();
+        };
+        if is_anaphora_operator(text) {
             return text.to_owned();
         }
-        let stem = text
-            .strip_suffix(SEMA_ANAPHORA_MARK)
-            .or_else(|| text.strip_suffix(ANAPHORA_MARK))
-            .unwrap_or(text);
-        let mark = text.get(stem.len()..).unwrap_or_default();
+        if !text.contains(QUALIFIER_SEPARATOR) || dti.resolve_form(text) != FormResolution::Unknown
+        {
+            return self.normalize_atom(text, token.start);
+        }
         let mut normalized = String::with_capacity(text.len());
         let mut cursor = token.start;
-        for (position, atom) in stem.split(QUALIFIER_SEPARATOR).enumerate() {
+        for (position, atom) in text.split(QUALIFIER_SEPARATOR).enumerate() {
             if position > 0 {
                 normalized.push(QUALIFIER_SEPARATOR);
             }
@@ -884,7 +917,6 @@ impl Assist<'_, '_> {
                 .saturating_add(atom.len())
                 .saturating_add(QUALIFIER_SEPARATOR.len_utf8());
         }
-        normalized.push_str(mark);
         normalized
     }
 
@@ -1003,14 +1035,33 @@ impl Assist<'_, '_> {
         None
     }
 
-    /// Checks a Normal glyph slot after normalization: `text` is the
-    /// normalized (primary-form) text of `token`.
-    fn check_unknown(&mut self, token: Token<'_>, text: &str) {
+    /// Checks a Normal glyph slot against the DTI after normalization: `text`
+    /// is the normalized (primary-form) text of `token`; `chosen` is `true` when
+    /// the user already selected Glyph for this slot.
+    fn check_unknown(&mut self, token: Token<'_>, text: &str, chosen: bool) {
         let Some(dti) = self.dti else {
             return;
         };
-        if text.starts_with(RAW_STRING_QUOTE) || text.contains(ANAPHORA_MARK) {
+        if is_anaphora_operator(text) {
             return;
+        }
+        let glyph = is_known_glyph(dti, text);
+        if !chosen && dti.label(token.text).is_some() {
+            let note = if glyph {
+                AssistNote::GlyphOrLabel {
+                    token: token.text.to_owned(),
+                    span: token.span(),
+                }
+            } else {
+                AssistNote::Label {
+                    token: token.text.to_owned(),
+                    span: token.span(),
+                }
+            };
+            self.notes.push(note);
+            if !glyph {
+                return;
+            }
         }
         // B9: the morphology flags are validated as in stage 3, on primary forms.
         if let Err(ResolveError::MorphViolation { form, key, flag }) = resolve_glyph_text(text, dti)
@@ -1020,20 +1071,86 @@ impl Assist<'_, '_> {
                 token.span(),
             );
         }
-        // DTI forms are atoms: the glyph is unknown when one of its non-numeral
-        // atoms is absent from the DTI (for a single atom: the whole glyph).
-        let has_unknown_atom = text.split(QUALIFIER_SEPARATOR).any(|atom| {
-            let is_numeral = !atom.is_empty() && atom.bytes().all(|b| b.is_ascii_digit());
-            !is_numeral && dti.resolve_form(atom) == FormResolution::Unknown
-        });
-        if has_unknown_atom {
+        if !glyph {
             self.notes.push(AssistNote::UnknownGlyph {
                 token: token.text.to_owned(),
                 span: token.span(),
-                label_suggestion: reclassify_as_label(token.text).ok(),
+                structural: tiles::is_reserved(token.text),
             });
         }
     }
+}
+
+/// Records in the session the Label choices returned by
+/// [`preprocess_with_choices`] (v4.1): `labels` are byte spans in the text that
+/// was ingested in a single [`Session::ingest`] call, `ids` the periods that
+/// call produced. Returns the number of slots marked as labels.
+pub fn apply_label_choices(session: &mut Session, ids: &[PeriodId], labels: &[Span]) -> usize {
+    let mut marked: Vec<SlotRef> = Vec::new();
+    for id in ids {
+        let Some(period) = session.period(*id) else {
+            continue;
+        };
+        let count = u32::try_from(period.clause_count()).unwrap_or(u32::MAX);
+        for index in 0..count {
+            let Some(block) = period.clause(index) else {
+                break;
+            };
+            let clause = GlobalClause {
+                period: *id,
+                clause: ClauseId::new(index),
+            };
+            let spans: Vec<(u32, Span)> = match block {
+                ClauseRef::Relational(block) => (0_u32..)
+                    .zip(
+                        std::iter::once(block.signal.glyph.span)
+                            .chain(block.cases.iter().map(|pair| pair.glyph.span)),
+                    )
+                    .collect(),
+                ClauseRef::Definition(block) => (1_u32..)
+                    .zip(block.operations.iter())
+                    .filter_map(|(position, op)| match op {
+                        DefOperation::Assign { value, .. }
+                        | DefOperation::Modify { value, .. }
+                        | DefOperation::Union { value, .. } => Some((position, value.span)),
+                        DefOperation::Unbind { .. } => None,
+                    })
+                    .collect(),
+                ClauseRef::Portability(_) => Vec::new(),
+            };
+            marked.extend(
+                spans
+                    .into_iter()
+                    .filter(|(_, span)| labels.contains(span))
+                    .map(|(position, _)| SlotRef {
+                        clause,
+                        slot: SlotIndex::new(position),
+                    }),
+            );
+        }
+    }
+    marked
+        .into_iter()
+        .filter(|slot| session.set_slot_kind(*slot, SlotKind::Label))
+        .count()
+}
+
+/// The exact anaphora operators `~` and `~~` (the only non-glyph tokens of an
+/// even slot).
+fn is_anaphora_operator(text: &str) -> bool {
+    text == SEMA_ANAPHORA_MARK || text.strip_prefix(ANAPHORA_MARK) == Some("")
+}
+
+/// `true` for a known glyph: a DTI primary form (whole token first), an ASCII
+/// numeral or a `§` union of known segments.
+fn is_known_glyph(dti: &Dti, text: &str) -> bool {
+    let numeral = |t: &str| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit());
+    numeral(text)
+        || is_glyph_form(dti, text)
+        || (text.contains(QUALIFIER_SEPARATOR)
+            && text
+                .split(QUALIFIER_SEPARATOR)
+                .all(|atom| numeral(atom) || (!atom.is_empty() && is_glyph_form(dti, atom))))
 }
 
 /// `true` if `atom` is the primary form of a concept in the local or in the

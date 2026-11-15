@@ -7,26 +7,42 @@
 //! signal_underscore = true
 //! symbol_aliases = true
 //! multiword = true
+//! autocomplete = "auto"            # or "manual" (v4.1)
 //!
 //! [shortcuts.comparative]
 //! prefix = "Alt+C"
 //! ">" = "cha"
 //!
+//! [shortcuts.actions]               # v4.1
+//! suggest = "Alt+Down"
+//! copy_absolute = "Ctrl+C"
+//! copy_relative = "Alt+C"
+//!
 //! [custom_shortcuts]
 //! "Alt+V" = "@live_variables"
 //! "F5" = "/^ "
+//!
+//! [warnings]                        # v4.1, at the user's own risk
+//! ERR_SEMANTIC = "warning"
+//! ERR_REFERENCE = "error"
 //! ```
 //!
 //! Strict: unknown tables and keys are errors. Missing `[editor]` keys keep
-//! their default (`true`). A present `[shortcuts.comparative]` table defines
-//! the **whole** mapping (its `prefix` defaults to `Alt+C`); an absent table
-//! keeps the approved default mapping.
+//! their default (`true`, `autocomplete = "auto"`). A present
+//! `[shortcuts.comparative]` table defines the **whole** mapping (its `prefix`
+//! defaults to `Alt+C`); an absent table keeps the approved default mapping.
+//! `[shortcuts.actions]` keys default to the values above; `copy_relative` may
+//! equal the comparative prefix, because the two contexts are disjoint (with a
+//! selection: relative copy; without: comparative insertion). In `[warnings]`
+//! every code is set individually; a code not listed stays an error, and
+//! structural errors stay blocking anyway.
 
 use std::fmt;
 
 use super::preprocess::AssistSettings;
 use super::toml::{self, Entry, Value};
 use crate::ast::Comparative;
+use crate::error::{ErrorCode, WarningCodes};
 
 /// Custom shortcut value that lists the live `def` variables.
 pub const LIVE_VARIABLES_ACTION: &str = "@live_variables";
@@ -34,17 +50,27 @@ pub const LIVE_VARIABLES_ACTION: &str = "@live_variables";
 const TABLE_EDITOR: &str = "editor";
 const TABLE_COMPARATIVE: &str = "shortcuts.comparative";
 const TABLE_CUSTOM: &str = "custom_shortcuts";
+const TABLE_ACTIONS: &str = "shortcuts.actions";
+const TABLE_WARNINGS: &str = "warnings";
+const KEY_AUTOCOMPLETE: &str = "autocomplete";
+const KEY_SUGGEST: &str = "suggest";
+const KEY_COPY_ABSOLUTE: &str = "copy_absolute";
+const KEY_COPY_RELATIVE: &str = "copy_relative";
+const DOWN_KEY: &str = "Down";
 const KEY_PREFIX: &str = "prefix";
 const MAX_FUNCTION_KEY: u8 = 12;
 
 // ═══════════════════════════ Chords ═══════════════════════════
 
-/// Key of a chord: one printable character or a function key `F1`–`F12`.
+/// Key of a chord: one printable character, a function key `F1`–`F12` or the
+/// `Down` arrow (v4.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     /// ASCII letters are normalized to uppercase.
     Char(char),
     Function(u8),
+    /// Down arrow (`Alt+Down` opens the suggestion menu).
+    Down,
 }
 
 /// Key combination such as `Alt+C`, `Ctrl+Shift+X` or `F5`.
@@ -81,7 +107,7 @@ impl fmt::Display for ChordError {
             Self::DuplicateModifier { modifier } => write!(f, "duplicate modifier '{modifier}'"),
             Self::InvalidKey { key } => write!(
                 f,
-                "invalid key '{key}' (expected one printable character or F1-F12)"
+                "invalid key '{key}' (expected one printable character, F1-F12 or Down)"
             ),
             Self::MissingModifier => {
                 f.write_str("a character key needs a Ctrl, Alt or Meta modifier")
@@ -104,6 +130,9 @@ fn parse_key(text: &str) -> Result<Key, ChordError> {
     let invalid = || ChordError::InvalidKey {
         key: text.to_owned(),
     };
+    if text.eq_ignore_ascii_case(DOWN_KEY) {
+        return Ok(Key::Down);
+    }
     let mut chars = text.chars();
     let first = chars.next().ok_or_else(invalid)?;
     if chars.as_str().is_empty() {
@@ -143,6 +172,25 @@ impl Chord {
         Self {
             alt: true,
             ..Self::plain(ch)
+        }
+    }
+
+    /// `Ctrl` + key.
+    pub const fn ctrl(ch: char) -> Self {
+        Self {
+            ctrl: true,
+            ..Self::plain(ch)
+        }
+    }
+
+    /// `Alt` + `Down` arrow.
+    pub const fn alt_down() -> Self {
+        Self {
+            ctrl: false,
+            alt: true,
+            shift: false,
+            meta: false,
+            key: Key::Down,
         }
     }
 
@@ -201,7 +249,7 @@ impl Chord {
                 key: Key::Char(normalize_char(ch)),
                 ..self
             },
-            Key::Function(_) => self,
+            Key::Function(_) | Key::Down => self,
         }
     }
 }
@@ -222,6 +270,7 @@ impl fmt::Display for Chord {
         match self.key {
             Key::Char(ch) => write!(f, "{}", normalize_char(ch)),
             Key::Function(n) => write!(f, "F{n}"),
+            Key::Down => f.write_str(DOWN_KEY),
         }
     }
 }
@@ -274,14 +323,61 @@ pub enum ShortcutAction {
     LiveVariables,
 }
 
+/// When the suggestion menu opens (v4.1, `[editor] autocomplete`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Autocomplete {
+    /// The menu opens automatically under the text while typing.
+    #[default]
+    Auto,
+    /// The menu opens only on request (`suggest` chord, `Alt+Down`).
+    Manual,
+}
+
+impl Autocomplete {
+    pub const fn surface(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// `[shortcuts.actions]` (v4.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActionShortcuts {
+    /// Opens the suggestion menu (default `Alt+Down`).
+    pub suggest: Chord,
+    /// With a selection: copy as an absolute anchor block (default `Ctrl+C`).
+    pub copy_absolute: Chord,
+    /// With a selection: copy as a relative anchor block (default `Alt+C`).
+    pub copy_relative: Chord,
+}
+
+impl Default for ActionShortcuts {
+    fn default() -> Self {
+        Self {
+            suggest: Chord::alt_down(),
+            copy_absolute: Chord::ctrl('c'),
+            copy_relative: Chord::alt('c'),
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct EditorSettings {
     /// `[editor]` booleans.
     pub assist: AssistSettings,
+    /// `[editor] autocomplete`.
+    pub autocomplete: Autocomplete,
     /// `[shortcuts.comparative]`.
     pub comparative: ComparativeShortcuts,
+    /// `[shortcuts.actions]`.
+    pub actions: ActionShortcuts,
     /// `[custom_shortcuts]`, in file order.
     pub custom: Vec<(Chord, ShortcutAction)>,
+    /// `[warnings]`: codes downgraded to warnings (pass them to
+    /// [`crate::ParserConfig::warnings`]).
+    pub warnings: WarningCodes,
 }
 
 // ═══════════════════════════ Errors ═══════════════════════════
@@ -350,13 +446,25 @@ pub enum SettingsErrorKind {
     DuplicateChord {
         chord: String,
     },
-    /// A custom chord equal to the comparative prefix.
+    /// A custom chord equal to the comparative prefix or to an editor action.
     ChordConflict {
         chord: String,
     },
     EmptyInsertion,
     ControlCharacterInInsertion {
         ch: char,
+    },
+    /// `autocomplete` is neither `"auto"` nor `"manual"`.
+    InvalidAutocomplete {
+        value: String,
+    },
+    /// A `[warnings]` key that is not one of the 6 error codes.
+    UnknownErrorCode {
+        code: String,
+    },
+    /// A `[warnings]` value other than `"warning"` / `"error"`.
+    InvalidSeverity {
+        value: String,
     },
 }
 
@@ -394,7 +502,10 @@ impl fmt::Display for SettingsErrorKind {
             Self::InvalidChord { chord, error } => write!(f, "invalid chord '{chord}': {error}"),
             Self::DuplicateChord { chord } => write!(f, "duplicate chord '{chord}'"),
             Self::ChordConflict { chord } => {
-                write!(f, "chord '{chord}' is already the comparative prefix")
+                write!(
+                    f,
+                    "chord '{chord}' is already the comparative prefix or an editor action"
+                )
             }
             Self::EmptyInsertion => f.write_str("empty insertion text"),
             Self::ControlCharacterInInsertion { ch } => write!(
@@ -402,6 +513,16 @@ impl fmt::Display for SettingsErrorKind {
                 "control character U+{:04X} in insertion text",
                 u32::from(*ch)
             ),
+            Self::InvalidAutocomplete { value } => {
+                write!(f, "autocomplete '{value}' must be \"auto\" or \"manual\"")
+            }
+            Self::UnknownErrorCode { code } => write!(
+                f,
+                "'{code}' is not an error code (ERR_SYNTAX ERR_ORDER ERR_REFERENCE ERR_SEMANTIC ERR_SCOPE ERR_CASE_AMBIGUITY)"
+            ),
+            Self::InvalidSeverity { value } => {
+                write!(f, "severity '{value}' must be \"warning\" or \"error\"")
+            }
         }
     }
 }
@@ -412,8 +533,30 @@ fn error(errors: &mut Vec<SettingsError>, line: usize, kind: SettingsErrorKind) 
     errors.push(SettingsError { line, kind });
 }
 
-fn apply_editor(entries: Vec<Entry>, assist: &mut AssistSettings, errors: &mut Vec<SettingsError>) {
+fn apply_editor(
+    entries: Vec<Entry>,
+    assist: &mut AssistSettings,
+    autocomplete: &mut Autocomplete,
+    errors: &mut Vec<SettingsError>,
+) {
     for Entry { key, value, line } in entries {
+        if key == KEY_AUTOCOMPLETE {
+            match value {
+                Value::String(text) => match text.as_str() {
+                    "auto" => *autocomplete = Autocomplete::Auto,
+                    "manual" => *autocomplete = Autocomplete::Manual,
+                    _ => error(
+                        errors,
+                        line,
+                        SettingsErrorKind::InvalidAutocomplete { value: text },
+                    ),
+                },
+                Value::Boolean(_) | Value::Integer(_) => {
+                    error(errors, line, SettingsErrorKind::ExpectedString { key });
+                }
+            }
+            continue;
+        }
         let flag = match key.as_str() {
             "braces" => &mut assist.braces,
             "comments" => &mut assist.comments,
@@ -510,6 +653,67 @@ fn parse_comparative(
     (shortcuts, prefix_line)
 }
 
+/// `[shortcuts.actions]`: every key is optional (defaults of
+/// [`ActionShortcuts`]).
+fn parse_actions(entries: Vec<Entry>, errors: &mut Vec<SettingsError>) -> ActionShortcuts {
+    let mut actions = ActionShortcuts::default();
+    for Entry { key, value, line } in entries {
+        let slot = match key.as_str() {
+            KEY_SUGGEST => &mut actions.suggest,
+            KEY_COPY_ABSOLUTE => &mut actions.copy_absolute,
+            KEY_COPY_RELATIVE => &mut actions.copy_relative,
+            _ => {
+                error(
+                    errors,
+                    line,
+                    SettingsErrorKind::UnknownKey {
+                        table: TABLE_ACTIONS.to_owned(),
+                        key,
+                    },
+                );
+                continue;
+            }
+        };
+        let Value::String(text) = value else {
+            error(errors, line, SettingsErrorKind::ExpectedString { key });
+            continue;
+        };
+        if let Some(chord) = parse_chord(text, line, errors) {
+            *slot = chord;
+        }
+    }
+    actions
+}
+
+/// `[warnings]`: one entry per error code, `"warning"` or `"error"`.
+fn parse_warnings(entries: Vec<Entry>, errors: &mut Vec<SettingsError>) -> WarningCodes {
+    let mut warnings = WarningCodes::NONE;
+    for Entry { key, value, line } in entries {
+        let Some(code) = ErrorCode::from_name(&key) else {
+            error(
+                errors,
+                line,
+                SettingsErrorKind::UnknownErrorCode { code: key },
+            );
+            continue;
+        };
+        let Value::String(text) = value else {
+            error(errors, line, SettingsErrorKind::ExpectedString { key });
+            continue;
+        };
+        match text.as_str() {
+            "warning" => warnings = warnings.with(code),
+            "error" => warnings = warnings.without(code),
+            _ => error(
+                errors,
+                line,
+                SettingsErrorKind::InvalidSeverity { value: text },
+            ),
+        }
+    }
+    warnings
+}
+
 fn parse_action(
     text: String,
     line: usize,
@@ -580,7 +784,14 @@ pub fn parse_settings(src: &str) -> Result<EditorSettings, Vec<SettingsError>> {
     }
     for table in document.tables {
         match table.name.as_str() {
-            TABLE_EDITOR => apply_editor(table.entries, &mut settings.assist, &mut errors),
+            TABLE_EDITOR => apply_editor(
+                table.entries,
+                &mut settings.assist,
+                &mut settings.autocomplete,
+                &mut errors,
+            ),
+            TABLE_ACTIONS => settings.actions = parse_actions(table.entries, &mut errors),
+            TABLE_WARNINGS => settings.warnings = parse_warnings(table.entries, &mut errors),
             TABLE_COMPARATIVE => {
                 let (shortcuts, line) = parse_comparative(table.entries, &mut errors);
                 settings.comparative = shortcuts;
@@ -596,8 +807,15 @@ pub fn parse_settings(src: &str) -> Result<EditorSettings, Vec<SettingsError>> {
     }
 
     let prefix = settings.comparative.prefix;
+    let actions = settings.actions;
+    let reserved = [
+        prefix,
+        actions.suggest,
+        actions.copy_absolute,
+        actions.copy_relative,
+    ];
     for (chord, action, line) in custom {
-        if chord == prefix {
+        if reserved.contains(&chord) {
             error(
                 &mut errors,
                 line.max(prefix_line.unwrap_or_default()),
@@ -632,6 +850,10 @@ impl EditorSettings {
         ] {
             out.push_str(&format!("{name} = {on}\n"));
         }
+        out.push_str(&format!(
+            "{KEY_AUTOCOMPLETE} = {}\n",
+            toml::quote(self.autocomplete.surface())
+        ));
 
         out.push_str(&format!(
             "\n[{TABLE_COMPARATIVE}]\n{KEY_PREFIX} = {}\n",
@@ -645,6 +867,15 @@ impl EditorSettings {
             ));
         }
 
+        out.push_str(&format!("\n[{TABLE_ACTIONS}]\n"));
+        for (name, chord) in [
+            (KEY_SUGGEST, self.actions.suggest),
+            (KEY_COPY_ABSOLUTE, self.actions.copy_absolute),
+            (KEY_COPY_RELATIVE, self.actions.copy_relative),
+        ] {
+            out.push_str(&format!("{name} = {}\n", toml::quote(&chord.to_string())));
+        }
+
         out.push_str(&format!("\n[{TABLE_CUSTOM}]\n"));
         for (chord, action) in &self.custom {
             let value = match action {
@@ -652,6 +883,16 @@ impl EditorSettings {
                 ShortcutAction::LiveVariables => toml::quote(LIVE_VARIABLES_ACTION),
             };
             out.push_str(&format!("{} = {value}\n", toml::quote(&chord.to_string())));
+        }
+
+        out.push_str(&format!("\n[{TABLE_WARNINGS}]\n"));
+        for code in ErrorCode::ALL {
+            let severity = if self.warnings.contains(code) {
+                "warning"
+            } else {
+                "error"
+            };
+            out.push_str(&format!("{} = {}\n", code.as_str(), toml::quote(severity)));
         }
         out
     }

@@ -1,8 +1,8 @@
 //! Phase B tests: keys, `.awdti` parsing, cross validation, lookups and policy.
 
 use super::{
-    Dti, DtiDiagnostic, DtiErrorKind, DtiKey, DtiSource, FormResolution, KeyError, KeyResolution,
-    UnknownKeyPolicy,
+    CensusKind, CensusWarning, Dti, DtiDiagnostic, DtiErrorKind, DtiKey, DtiSource, FormResolution,
+    KeyError, KeyResolution, UnknownKeyPolicy,
 };
 
 type TestResult = Result<(), String>;
@@ -358,14 +358,19 @@ fn record_errors() -> TestResult {
         DtiSource::Universal,
         DtiErrorKind::DuplicatePrimary,
     )?;
-    expect_error(
-        &format!("{}rec {} Green\n", f.universal, k("upper")?),
+    // v4.1: uppercase and `_` are valid in forms; `~` alone is not.
+    Dti::load(
+        &format!(
+            "{}rec {} Green\nrec {} a_b\n",
+            f.universal,
+            k("upper")?,
+            k("under")?
+        ),
         &f.local,
-        DtiSource::Universal,
-        DtiErrorKind::InvalidForm,
-    )?;
+    )
+    .map_err(|d| format!("{d:#?}"))?;
     expect_error(
-        &format!("{}rec {} a_b\n", f.universal, k("under")?),
+        &format!("{}rec {} ~\n", f.universal, k("tilde")?),
         &f.local,
         DtiSource::Universal,
         DtiErrorKind::InvalidForm,
@@ -439,30 +444,133 @@ fn base_cycles_are_rejected() -> TestResult {
 }
 
 #[test]
-fn forms_are_single_atoms() -> TestResult {
+fn forms_admit_any_visible_character_v4_1() -> TestResult {
     let f = fixture()?;
-    // Primary form, `syn:` and local `form:` must not contain `§` (§16.3).
-    for (universal, local, source) in [
-        (
-            f.universal.replacen("door\n", "door§front\n", 1),
-            f.local.to_owned(),
+    // v4.1: `§`, `"`, uppercase, punctuation and other scripts are valid forms;
+    // a form containing `§` is one glyph (looked up whole).
+    let universal = f.universal.replacen("door\n", "Door§front\"x\n", 1);
+    let local = f
+        .local
+        .replacen("form:verdesmeraldo", "form:verde§smeraldo", 1)
+        .replacen("form:porta", "form:東京", 1);
+    let dti = Dti::load(&universal, &local).map_err(|d| format!("{d:#?}"))?;
+    check(
+        "local form with §",
+        dti.resolve_primary("verde§smeraldo"),
+        FormResolution::Unique(key("greenemerald")?),
+    )?;
+    check(
+        "universal form with § and \"",
+        dti.resolve_primary("Door§front\"x"),
+        FormResolution::Unique(key("door")?),
+    )?;
+    check(
+        "other script",
+        dti.resolve_primary("東京"),
+        FormResolution::Unique(key("door")?),
+    )?;
+    // Only the anaphora operators and invisible characters are refused.
+    for bad in ["~", "~~", "x\u{202E}y", "x\u{200B}"] {
+        expect_error(
+            &f.universal.replacen("door\n", &format!("{bad}\n"), 1),
+            &f.local,
             DtiSource::Universal,
-        ),
-        (
-            f.universal.replacen("syn:verdant", "syn:verdant§deep", 1),
-            f.local.to_owned(),
-            DtiSource::Universal,
-        ),
-        (
-            f.universal.to_owned(),
-            f.local
-                .replacen("form:verdesmeraldo", "form:verde§smeraldo", 1),
-            DtiSource::Local,
-        ),
-    ] {
-        expect_error(&universal, &local, source, DtiErrorKind::QualifiedForm)?;
+            DtiErrorKind::InvalidForm,
+        )?;
     }
     Ok(())
+}
+
+#[test]
+fn labels_coexist_with_glyphs_v4_1() -> TestResult {
+    let f = fixture()?;
+    let (roma, verde, green, door) = (
+        key("labelroma")?,
+        key("labelverde")?,
+        key("labelgreen")?,
+        key("localdoor")?,
+    );
+    let local = format!(
+        "{}label {roma} Roma\nlabel {verde} verde\nlabel {green} green\nnew {door} door\n",
+        f.local
+    );
+    let dti = Dti::load(&f.universal, &local).map_err(|d| format!("{d:#?}"))?;
+    check("label Roma", dti.label("Roma"), Some(roma))?;
+    check("label count", dti.overlay().labels().len(), 3)?;
+    check(
+        "label form",
+        dti.overlay().labels().form(&verde),
+        Some("verde"),
+    )?;
+    // `verde` is both a local glyph and a local label.
+    check("label verde", dti.label("verde"), Some(verde))?;
+    check(
+        "glyph verde",
+        dti.resolve_primary("verde"),
+        FormResolution::Unique(key("green")?),
+    )?;
+    // Census warnings: forms that are already universal glyphs (exchange
+    // language), never errors.
+    check(
+        "census warnings",
+        dti.overlay().census_warnings(),
+        &[
+            CensusWarning {
+                line: 15,
+                kind: CensusKind::Label,
+                form: Box::from("green"),
+                universal: key("green")?,
+            },
+            CensusWarning {
+                line: 16,
+                kind: CensusKind::Glyph,
+                form: Box::from("door"),
+                universal: key("door")?,
+            },
+        ][..],
+    )
+}
+
+#[test]
+fn label_record_rules_v4_1() -> TestResult {
+    let f = fixture()?;
+    let (a, b) = (k("labela")?, k("labelb")?);
+    expect_error(
+        &f.universal,
+        &format!("{}label {a} roma\nlabel {b} roma\n", f.local),
+        DtiSource::Local,
+        DtiErrorKind::DuplicateLabel,
+    )?;
+    expect_error(
+        &f.universal,
+        &format!("{}label {a} roma\nlabel {a} milano\n", f.local),
+        DtiSource::Local,
+        DtiErrorKind::DuplicateKey(key("labela")?),
+    )?;
+    expect_error(
+        &f.universal,
+        &format!("{}label {} roma\n", f.local, k("door")?),
+        DtiSource::Local,
+        DtiErrorKind::LocalShadowsUniversal(key("door")?),
+    )?;
+    expect_error(
+        &f.universal,
+        &format!("{}label {a} roma display:\"Roma\"\n", f.local),
+        DtiSource::Local,
+        DtiErrorKind::TagNotAllowed,
+    )?;
+    expect_error(
+        &f.universal,
+        &format!("{}label {a}\n", f.local),
+        DtiSource::Local,
+        DtiErrorKind::MissingField { name: "primary" },
+    )?;
+    expect_error(
+        &format!("{}rec {a} roma\nlabel {b} roma\n", f.universal),
+        &f.local,
+        DtiSource::Universal,
+        DtiErrorKind::UnknownRecordKind,
+    )
 }
 
 #[test]
@@ -530,7 +638,7 @@ fn overlay_rules_b5_b6_d6() -> TestResult {
 #[test]
 fn all_diagnostics_are_collected_and_sorted() -> TestResult {
     let f = fixture()?;
-    let universal = format!("{}rec {} Bad\nrec bad x\n", f.universal, k("bad1")?);
+    let universal = format!("{}rec {} ~~\nrec bad x\n", f.universal, k("bad1")?);
     let local = format!("{}use {}\n", f.local, k("ghost")?);
     match Dti::load(&universal, &local) {
         Ok(_) => Err("accepted".to_owned()),

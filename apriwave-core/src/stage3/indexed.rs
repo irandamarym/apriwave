@@ -5,23 +5,26 @@
 //! period valid at stage 2 is transmissible (`def` blocks, portability blocks and
 //! anaphora included):
 //!
-//! - glyph paths (slot glyphs, `def` values, `glyph~~` bases) → one key per `§`
-//!   segment (`<K1>§…§<Kn>`): DTI forms are atoms, so the `§` structure of the
-//!   lexical and of the indexed form is identical and anaphora resolve the same;
-//! - `base~` → `<K>~`, `base§mod~` → `<K1>§<K2>~`;
-//! - **bound symbols** — `def` variable names, their references (R13: an atomic
-//!   glyph resolved by stage 2 as a live variable) and portability-id atoms — live
-//!   in the session, not in the static DTI: an enabled primary form keeps its DTI
+//! - glyph tokens (slot glyphs, `def` values) → the key of the whole token when
+//!   it is a DTI form (`§` included), otherwise one key per `§` segment
+//!   (`<K1>§…§<Kn>`);
+//! - labels (v4.1) → `LVAAAA<form>` for a slot marked as a label in the session
+//!   (see [`super::label`]); a token already in wire-label form
+//!   (`LVA<XYZ><form>`, e.g. received) is kept verbatim, subtype included; every
+//!   unmarked slot is a glyph;
+//! - **bound symbols** — `def` variable names, their references (R13: a glyph
+//!   token resolved by stage 2 as a live variable) and portability ids — live in
+//!   the session, not in the static DTI: an enabled primary form keeps its DTI
 //!   key, any other symbol gets an ephemeral session key
 //!   ([`DtiKey::session_symbol`]);
-//! - raw strings, numerals and the marks `~`, `~~` are kept literally.
+//! - numerals and the marks `~`, `~~` are kept literally.
 
 use crate::prelude::*;
 
 use core::fmt;
 
-use crate::analyze::{ClauseId, Resolution, SlotIndex};
-use crate::ast::{GlyphPath, QUALIFIER_SEPARATOR};
+use crate::analyze::{ClauseId, GlobalClause, Resolution, SlotIndex, SlotRef};
+use crate::ast::GlyphPath;
 use crate::dti::{Dti, DtiKey, FormResolution, KeyError};
 use crate::printer::{
     period_clause_tokens, render_period, render_period_with, GlyphMap, GlyphSite,
@@ -30,6 +33,7 @@ use crate::session::{PeriodId, Session};
 use crate::symbol::Symbol;
 
 use super::expand::WireMode;
+use super::label::{label_wire, slot_content, SlotContent};
 use super::resolve::{resolve_atom, resolve_path, ResolveError};
 
 /// Errors of the indexed rendering.
@@ -64,6 +68,10 @@ impl From<ResolveError> for IndexError {
 /// an ephemeral session key. A primary form shared by two enabled concepts in the
 /// two languages is ambiguous (B3).
 pub(crate) fn symbol_key(dti: &Dti, text: &str) -> Result<DtiKey, IndexError> {
+    // A symbol received in indexed form is already a key: it is kept (relay).
+    if let Ok(key) = DtiKey::parse(text) {
+        return Ok(key);
+    }
     match dti.resolve_primary(text) {
         FormResolution::Unique(key) if dti.is_enabled(&key) => Ok(key),
         FormResolution::Ambiguous(keys) if keys.iter().any(|k| dti.is_enabled(k)) => {
@@ -76,6 +84,22 @@ pub(crate) fn symbol_key(dti: &Dti, text: &str) -> Result<DtiKey, IndexError> {
             DtiKey::session_symbol(text).map_err(IndexError::SessionSymbol)
         }
     }
+}
+
+/// `true` when every `§` segment of a glyph is already an enabled DTI key or an
+/// ASCII numeral (a period received in indexed form and rendered again, e.g. by
+/// a relay): the text is kept as it is.
+fn already_indexed(dti: &Dti, text: &str) -> bool {
+    let mut has_key = false;
+    let all = text.split(crate::ast::QUALIFIER_SEPARATOR).all(|segment| {
+        if let Ok(key) = DtiKey::parse(segment) {
+            has_key = true;
+            dti.is_enabled(&key)
+        } else {
+            !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit())
+        }
+    });
+    all && has_key
 }
 
 /// Glyph map writing DTI keys.
@@ -97,7 +121,17 @@ impl IndexedMap<'_> {
         Ok(symbol_key(self.dti, self.text(atom)?)?.as_str().to_owned())
     }
 
-    /// R13: the slot holds an atomic glyph resolved by stage 2 as a live variable.
+    fn slot_ref(&self, clause: u32, pair: u32) -> SlotRef {
+        SlotRef {
+            clause: GlobalClause {
+                period: self.period,
+                clause: ClauseId::new(clause),
+            },
+            slot: SlotIndex::new(pair),
+        }
+    }
+
+    /// R13: the slot holds a glyph token resolved by stage 2 as a live variable.
     fn is_variable_reference(&self, clause: u32, pair: u32) -> bool {
         self.session
             .analysis(self.period)
@@ -112,20 +146,22 @@ impl GlyphMap for IndexedMap<'_> {
 
     fn path(&mut self, path: &GlyphPath, site: GlyphSite) -> Result<String, IndexError> {
         match site {
-            GlyphSite::Slot { clause, pair }
-                if path.is_atomic() && self.is_variable_reference(clause, pair) =>
-            {
-                self.symbol(path.root)
+            GlyphSite::Slot { clause, pair } if self.is_variable_reference(clause, pair) => {
+                self.symbol(path.text)
             }
-            GlyphSite::PortabilityId => {
-                let mut out = self.symbol(path.root)?;
-                for qualifier in path.qualifiers.iter() {
-                    out.push(QUALIFIER_SEPARATOR);
-                    out.push_str(&self.symbol(*qualifier)?);
+            GlyphSite::PortabilityId => self.symbol(path.text),
+            GlyphSite::Slot { clause, pair } => {
+                let text = self.text(path.text)?;
+                match slot_content(self.session, self.slot_ref(clause, pair), text) {
+                    SlotContent::Label => Ok(label_wire(text)),
+                    SlotContent::WireLabel => Ok(text.to_owned()),
+                    SlotContent::Glyph if already_indexed(self.dti, text) => Ok(text.to_owned()),
+                    SlotContent::Glyph => {
+                        Ok(resolve_path(path, self.session.interner(), self.dti)?.indexed_text())
+                    }
                 }
-                Ok(out)
             }
-            GlyphSite::Slot { .. } | GlyphSite::DefName | GlyphSite::AnaphoraBase => {
+            GlyphSite::DefName | GlyphSite::Standalone => {
                 Ok(resolve_path(path, self.session.interner(), self.dti)?.indexed_text())
             }
         }
@@ -134,15 +170,11 @@ impl GlyphMap for IndexedMap<'_> {
     fn atom(&mut self, atom: Symbol, site: GlyphSite) -> Result<String, IndexError> {
         match site {
             GlyphSite::DefName | GlyphSite::PortabilityId => self.symbol(atom),
-            GlyphSite::Slot { .. } | GlyphSite::AnaphoraBase => {
+            GlyphSite::Slot { .. } | GlyphSite::Standalone => {
                 let text = self.text(atom)?;
                 Ok(resolve_atom(self.dti, text)?.to_string())
             }
         }
-    }
-
-    fn raw(&mut self, content: Symbol) -> Result<String, IndexError> {
-        self.text(content).map(str::to_owned)
     }
 }
 

@@ -1,8 +1,8 @@
 [package]
 name = "apriwave-core"
-version = "4.0.0"
+version = "4.1.0"
 edition = "2021"
-description = "ApriWave (ApricotWave Protocol v4.0) core: no_std + alloc, zero-dependency deterministic grammar, analysis, indexed M2M form, DTI, execution plan and policy"
+description = "ApriWave (GHLIP Protocol v4.1) core: no_std + alloc, zero-dependency deterministic grammar, analysis, indexed M2M form, DTI, execution plan and policy"
 authors = ["irandamarym"]
 license = "GPL-3.0-or-later"
 repository = "https://github.com/irandamarym/apriwave"

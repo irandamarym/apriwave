@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "apriwave"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "apriwave-core",
  "argon2",
@@ -15,7 +15,7 @@ dependencies = [
 
 [[package]]
 name = "apriwave-core"
-version = "4.0.0"
+version = "4.1.0"
 
 [[package]]
 name = "argon2"

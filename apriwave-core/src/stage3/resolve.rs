@@ -2,12 +2,14 @@
 //! of the morphology flags.
 //!
 //! Canonical text admits only **primary forms** (synonyms and `display` forms are
-//! normalized by the editor). DTI forms are single atoms, so a qualified glyph
-//! `s1§…§sn` is always resolved segment by segment into `<K1>§…§<Kn>`: the `§`
-//! structure is isomorphic between the lexical and the indexed form.
+//! normalized by the editor). v4.1: a DTI form may contain `§`, so the whole
+//! token is looked up first (`DTI priority`: a censused `a§b` is one glyph, one
+//! key); only when the whole token is not a form is a qualified glyph
+//! `s1§…§sn` resolved segment by segment into `<K1>§…§<Kn>` (an empty segment
+//! is an unknown form).
 //!
-//! - `[+UNION]`: in a qualified glyph every concept joined by `§` must carry
-//!   `+UNION`;
+//! - `[+UNION]`: in a segment-resolved glyph every concept joined by `§` must
+//!   carry `+UNION`;
 //! - `[+AGGL]` / `[+CONTR]`: a record with both `base:` and `param:` whose form is
 //!   a single atom is a compound form. When the form is the concatenation of a
 //!   primary form of `base` and one of `param` it is an agglutination (both
@@ -267,14 +269,13 @@ pub(crate) fn resolve_atom(dti: &Dti, atom: &str) -> Result<IndexedAtom, Resolve
     }
 }
 
-/// Every `§` segment is resolved on its own (DTI forms are atoms); every concept
+/// The whole token first, then every `§` segment on its own; every concept
 /// joined by `§` must carry `[+UNION]` (numerals are not concepts: exempt).
 pub fn resolve_path(
     path: &GlyphPath,
     interner: &Interner,
     dti: &Dti,
 ) -> Result<PathResolution, ResolveError> {
-    // Atoms never contain `§` (the parser splits on it): the text form is exact.
     let text = render_glyph_path(path, interner).map_err(|_| ResolveError::UnknownSymbol)?;
     resolve_glyph_text(&text, dti)
 }
@@ -290,12 +291,29 @@ pub(crate) fn union_violation(dti: &Dti, atoms: &[IndexedAtom]) -> Option<DtiKey
     })
 }
 
-/// Resolves the text of a glyph path (`a§b`): same rules as [`resolve_path`]
-/// (segment by segment, primary forms, morphology flags).
+/// Resolves the text of a glyph token (`a§b`): same rules as [`resolve_path`]
+/// (whole token first, then segment by segment; primary forms, morphology
+/// flags).
 pub fn resolve_glyph_text(text: &str, dti: &Dti) -> Result<PathResolution, ResolveError> {
+    let separator = crate::ast::QUALIFIER_SEPARATOR;
+    let whole_known = !matches!(dti.resolve_primary(text), FormResolution::Unknown);
+    if whole_known || !text.contains(separator) {
+        return Ok(match resolve_atom(dti, text)? {
+            IndexedAtom::Key(key) => PathResolution::Record(key),
+            numeral @ IndexedAtom::Numeral(_) => PathResolution::Segments(vec![numeral]),
+        });
+    }
     let atoms = text
-        .split(crate::ast::QUALIFIER_SEPARATOR)
-        .map(|segment| resolve_atom(dti, segment))
+        .split(separator)
+        .map(|segment| {
+            if segment.is_empty() {
+                Err(ResolveError::UnknownForm {
+                    form: text.to_owned(),
+                })
+            } else {
+                resolve_atom(dti, segment)
+            }
+        })
         .collect::<Result<Vec<IndexedAtom>, ResolveError>>()?;
     if let [IndexedAtom::Key(key)] = atoms.as_slice() {
         return Ok(PathResolution::Record(*key));

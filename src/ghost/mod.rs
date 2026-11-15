@@ -37,20 +37,19 @@
 //!   (R6 search scope: active DSP stack, level-0 blocks of the period, level-0
 //!   blocks carried by `/^/`, released on DSP pruning and on `^/` / `^^/`) and
 //!   the block being written. Hence `def` names, R13 references, `abfi`/`absi`/
-//!   `abse` names, `anchor`/`rel`/`reloff` ids (atom by atom) and anaphora bases
-//!   (`base~`, `base§mod~`, `glyph~~`) take the cipher atoms of what they refer
-//!   to, no other atom can capture them, and stage 2 resolves the ciphertext
+//!   `abse` names and `anchor`/`rel`/`reloff` ids take the cipher atoms of what
+//!   they refer to, no other atom can capture them, and stage 2 resolves the ciphertext
 //!   exactly like the plaintext. With an empty table `σ_P = τ_P`.
 //! - **What is encrypted (G5)**: every atom of the period: slot glyphs and their
-//!   `§` qualifiers, anaphora bases, `def` names and values, portability ids.
+//!   `§` qualifiers, `def` names and values, portability ids.
 //!   Numerals keep their length and base (leading zeros may appear); a numeral
 //!   without a declared numeral system ([`GhostError::NoNumeralSystem`]) or with
 //!   a digit `≥ B` ([`GhostError::DigitOutOfBase`]) is rejected. An ephemeral key
 //!   is accepted only as a bound symbol (`def` name, portability id, R13
 //!   reference): elsewhere the period is not a valid indexed form
 //!   ([`GhostError::UnboundEphemeralKey`]). The bare markers `~` and `~~`,
-//!   `abse ~`, `end ~`, connectors and keywords are left untouched; raw strings
-//!   are rejected. With [`GhostParams::permute_grammar_tiles`] the primary
+//!   `abse ~`, `end ~`, connectors and keywords are left untouched; labels
+//!   (`LVA…`, v4.1) are rejected ([`GhostError::Label`]). With [`GhostParams::permute_grammar_tiles`] the primary
 //!   signal (within `{ta, to, ka, ko, ot}`: `oh` is fixed), the tense slot
 //!   (within `{omitted, 6 indicative}` and within the 6 conditionals), the
 //!   number of every relational signal tile and of every case tile are also
@@ -218,8 +217,8 @@ pub enum GhostError {
     Stage2 { diagnostics: Vec<Diagnostic> },
     /// Exactly one period is required.
     PeriodCount { found: usize },
-    /// Raw strings cannot be encrypted.
-    RawString { span: Span },
+    /// Labels (`LVAAAA<form>`, v4.1) cannot be encrypted.
+    Label { span: Span },
     /// A numeral appears but the universal snapshot declares no numeral system.
     NoNumeralSystem { span: Span },
     /// A numeral digit is not below the base of the snapshot numeral system
@@ -294,10 +293,10 @@ impl fmt::Display for GhostError {
                 Ok(())
             }
             Self::PeriodCount { found } => write!(f, "exactly one period required, found {found}"),
-            Self::RawString { span } => {
+            Self::Label { span } => {
                 write!(
                     f,
-                    "raw string at {}..{} cannot be encrypted",
+                    "label at {}..{} cannot be encrypted",
                     span.start, span.end
                 )
             }

@@ -99,8 +99,8 @@ impl Fixture {
     /// shapes.
     fn sample(&self) -> Result<String, String> {
         Ok(format!(
-            "/^ taall {k0} a {k1}§{k2} : quatoalt {k1}~ d ~ y deepzato {k3}§{k4} n {k0}~~ \
-ab ~~ abelm {k5} g {k1}§{k2}§{k6}~ ^/",
+            "/^ taall {k0} a {k1}§{k2} : quatoalt ~ d ~ y deepzato {k3}§{k4} n ~~ \
+ab ~~ abelm {k5} g {k1}§{k2}§{k6} ^/",
             k0 = self.key(0)?,
             k1 = self.key(1)?,
             k2 = self.key(2)?,
@@ -868,15 +868,15 @@ fn anchors_rel_reloff_and_end_share_cipher_ids_atom_by_atom() -> TestResult {
     Ok(())
 }
 
-/// Bound anaphora (rule 3): `base~`, `base§mod~` and `glyph~~` take the cipher
-/// atoms of their antecedent; the ciphertext resolves like the plaintext.
+/// v4.1: only the operators `~` and `~~` remain; they are structural tokens,
+/// kept as written, and the ciphertext resolves like the plaintext.
 #[test]
-fn anaphora_bases_take_the_cipher_atoms_of_their_antecedent() -> TestResult {
+fn anaphora_operators_are_kept_and_resolve_alike() -> TestResult {
     let f = fixture(42)?;
     let k = (0..8).map(|i| f.key(i)).collect::<Result<Vec<_>, _>>()?;
     let key_at = |i: usize| k.get(i).copied().ok_or_else(|| format!("key {i}"));
     let plain = format!(
-        "/^ ta {k0}§{k1} a {k2}§{k3} d {k4} : ta {k0}~ d {k0}§{k1}§{k5}~ g {k0}§{k1}~~ ab {k6}§{k7} ^/",
+        "/^ ta {k0}§{k1} a {k2}§{k3} d {k4} : ta ~ d {k0}§{k1}§{k5} g ~~ ab {k6}§{k7} ^/",
         k0 = key_at(0)?,
         k1 = key_at(1)?,
         k2 = key_at(2)?,
@@ -891,19 +891,8 @@ fn anaphora_bases_take_the_cipher_atoms_of_their_antecedent() -> TestResult {
             let envelope = round_trip_with(&f, &plain, seed, permute)?;
             let tokens: Vec<&str> = envelope.ciphertext.split(' ').collect();
             let token = |i: usize| tokens.get(i).copied().ok_or_else(|| format!("token {i}"));
-            let antecedent = atoms(token(2)?);
-            check(
-                "base~",
-                atoms(token(9)?).first().copied(),
-                antecedent.first().copied(),
-            )?;
-            let inverse_atoms = atoms(token(11)?);
-            check(
-                "base§mod~ (matched prefix)",
-                inverse_atoms.get(..2),
-                antecedent.get(..2),
-            )?;
-            check("glyph~~", atoms(token(13)?), antecedent)?;
+            check("~ kept", token(9)?, "~")?;
+            check("~~ kept", token(13)?, "~~")?;
             stage2_valid(&[&envelope.ciphertext])?;
             same_resolutions(&[&plain], &[&envelope.ciphertext])?;
         }
@@ -1062,7 +1051,14 @@ fn ghost_session_carries_variables_and_antecedents_across_periods() -> TestResul
     let periods = [
         format!("/^ defu {d} a {}§{} ^/", k(1)?, k(2)?),
         format!("/^ ta {} nu {d} a {}§{} /^/", k(3)?, k(4)?, k(5)?),
-        format!("/^ ta ~ a {}~ d {}§{}§{}~ ^/", k(4)?, k(4)?, k(5)?, k(6)?),
+        format!(
+            "/^ ta ~ a {}§{} d {}§{}§{} ^/",
+            k(4)?,
+            k(5)?,
+            k(4)?,
+            k(5)?,
+            k(6)?
+        ),
         format!("/^ defu {d} abfi {} ^^/", k(7)?),
     ];
     let key = master_key();
@@ -1144,7 +1140,7 @@ fn ghost_session_releases_pruned_and_closed_antecedents() -> TestResult {
             k(8)?,
             k(9)?
         ),
-        format!("/^ ta {}~ a {} ^/", k(0)?, k(4)?),
+        format!("/^ ta ~ a {} ^/", k(4)?),
     ];
     let mut expected_after = vec![
         // Level-0 block (k0§k5) carried, variable k8 = k9 live; the pruned branch
@@ -1342,13 +1338,18 @@ fn encrypt_text(f: &Fixture, text: &str) -> Result<GhostEnvelope, GhostError> {
 }
 
 #[test]
-fn rejects_raw_strings_bad_keys_and_stage2_errors() -> TestResult {
+fn rejects_labels_bad_keys_and_stage2_errors() -> TestResult {
     let f = fixture(42)?;
     let k0 = f.key(0)?;
     expect_err(
-        "raw string",
+        "label (v4.1)",
+        encrypt_text(&f, &format!("/^ ta {k0} a LVAAAAHello ^/")),
+        |e| matches!(e, GhostError::Label { .. }),
+    )?;
+    expect_err(
+        "quoted word is an ordinary glyph, not a key",
         encrypt_text(&f, &format!("/^ ta {k0} a \"Hello\" ^/")),
-        |e| matches!(e, GhostError::RawString { .. }),
+        |e| matches!(e, GhostError::InvalidKey { .. }),
     )?;
     expect_err(
         "plain word",
@@ -1373,7 +1374,7 @@ fn rejects_raw_strings_bad_keys_and_stage2_errors() -> TestResult {
     )?;
     expect_err(
         "deprecated key",
-        encrypt_text(&f, &format!("/^ ta {k0} a {}~ ^/", f.deprecated)),
+        encrypt_text(&f, &format!("/^ ta {k0} a {} ^/", f.deprecated)),
         |e| matches!(e, GhostError::KeyNotInDomain { .. }),
     )?;
     expect_err(
@@ -1479,7 +1480,7 @@ fn numeral_digits_round_trip_with_same_length_and_base() -> TestResult {
         let digits: String = (0..base)
             .map(|d| char::from(b'0'.wrapping_add(d)))
             .collect();
-        let plain = format!("/^ ta {k0} a 1 d {k1}§10 g {digits} : ta {k1}~ n 1~~ ^/");
+        let plain = format!("/^ ta {k0} a 1 d {k1}§10 g {digits} : ta ~ n ~~ ^/");
         let mut changed = false;
         for seed in 0_u8..6 {
             for permute in [false, true] {

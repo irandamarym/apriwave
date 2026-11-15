@@ -40,12 +40,12 @@ use std::ops::Range;
 use crate::ast::{
     CaseTile, ClauseBlock, Conditional, DefOperation, DefinitionBlock, ExplicitNumber,
     GlyphAnaphora, GlyphSlot, LinkedClause, Period, PortabilityBlock, PrimarySignal,
-    RelationalSignal, SemaAnaphora, Temporal, TemporalMode, ANAPHORA_MARK, QUALIFIER_SEPARATOR,
-    SEMA_ANAPHORA_MARK,
+    RelationalSignal, SemaAnaphora, Temporal, TemporalMode, QUALIFIER_SEPARATOR,
 };
 use crate::dti::{Dti, DtiKey};
 use crate::parser::Parser;
 use crate::span::{Span, Spanned};
+use crate::stage3::LABEL_PREFIX;
 use crate::symbol::Interner;
 use crate::ParserConfig;
 
@@ -265,12 +265,6 @@ pub struct AtomSite {
 pub enum SlotForm {
     /// Glyph path (`K`, `K1§K2`).
     Glyph,
-    /// `base~`
-    Prefix,
-    /// `base§mod~`
-    Inverse,
-    /// `glyph~~`
-    SemaByGlyph,
 }
 
 /// A `[Tile] [Glyph]` slot of the period that holds atoms.
@@ -518,7 +512,7 @@ impl Layout {
         Ok(())
     }
 
-    /// Strips a trailing `~`/`~~` from the slot text and collects its atoms.
+    /// Collects the atoms of a glyph slot (labels are refused, v4.1).
     fn slot(
         &mut self,
         clause: u32,
@@ -529,20 +523,17 @@ impl Layout {
     ) -> Result<(), GhostError> {
         let span = glyph.span;
         let (suffix, form) = match &glyph.node {
-            GlyphSlot::RawString(_) => return Err(GhostError::RawString { span }),
             GlyphSlot::GlyphAnaphora(GlyphAnaphora::Exact)
             | GlyphSlot::SemaAnaphora(SemaAnaphora::Latest) => return Ok(()),
             GlyphSlot::Glyph(_) => (0, SlotForm::Glyph),
-            GlyphSlot::GlyphAnaphora(GlyphAnaphora::Prefix { .. }) => {
-                (ANAPHORA_MARK.len_utf8(), SlotForm::Prefix)
-            }
-            GlyphSlot::GlyphAnaphora(GlyphAnaphora::Inverse { .. }) => {
-                (ANAPHORA_MARK.len_utf8(), SlotForm::Inverse)
-            }
-            GlyphSlot::SemaAnaphora(SemaAnaphora::ByGlyph { .. }) => {
-                (SEMA_ANAPHORA_MARK.len(), SlotForm::SemaByGlyph)
-            }
         };
+        let (start, end) = range_of(span)?;
+        if text
+            .get(start..end)
+            .is_some_and(|token| token.starts_with(LABEL_PREFIX))
+        {
+            return Err(GhostError::Label { span });
+        }
         let index = self.slots.len();
         let (first, count) = self.path(span, suffix, text, AtomRole::Slot(index))?;
         self.slots.push(SlotSite {

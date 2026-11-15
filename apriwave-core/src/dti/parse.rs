@@ -1,8 +1,11 @@
 //! `.awdti` text format: parsing and validation (Phase B).
 //!
-//! One record per line, fields separated by a single space, values containing
-//! spaces enclosed in `"…"`. Lines starting with `#` are header directives and
-//! must precede the records; empty lines are ignored.
+//! One record per line, fields separated by a single space. Only the values of
+//! `display:` and `attr:` may contain spaces, enclosed in `"…"`; every other
+//! field (kind, key, lexical forms, `form:`, `syn:`) is taken literally, so a
+//! lexical form may contain any visible character, `"` included (v4.1). Lines
+//! starting with `#` are header directives and must precede the records; empty
+//! lines are ignored.
 //!
 //! Universal snapshot:
 //! ```text
@@ -22,7 +25,15 @@
 //! #policy degrade
 //! use <KEY> [form:<primary>] [display:"…"] [syn:…]
 //! new <KEY> <primary> [base:<KEY>] [display:"…"] [syn:…] [morph:…]
+//! label <KEY> <form>
 //! ```
+//!
+//! v4.1: a lexical form is any glyph token (any visible character, `§`
+//! included) except the two anaphora operators `~` and `~~`; only invisible
+//! characters are refused (D9). A `label` record censuses a local label: the
+//! same form may coexist as a glyph and as a label. A census warning (never an
+//! error) is recorded when a local glyph or label form is already the primary
+//! form of another universal glyph in the exchange language.
 
 use crate::prelude::*;
 
@@ -31,10 +42,9 @@ use core::fmt;
 
 use super::key::{DtiKey, KeyError};
 use super::model::{
-    ConceptRecord, Dti, LexicalEntry, Lexicon, LocalOverlay, MorphFlags, NumeralSystem,
-    UniversalSnapshot, UnknownKeyPolicy,
+    CensusKind, CensusWarning, ConceptRecord, Dti, LabelLexicon, LexicalEntry, Lexicon,
+    LocalOverlay, MorphFlags, NumeralSystem, UniversalSnapshot, UnknownKeyPolicy,
 };
-use crate::symbol::Interner;
 
 /// Only supported value of the `#awdti` directive.
 const FORMAT_VERSION: &str = "1";
@@ -79,9 +89,9 @@ pub enum DtiErrorKind {
     InvalidKey(KeyError),
     DuplicateKey(DtiKey),
     InvalidForm,
-    /// A primary form, `form:` or `syn:` contains the qualifier `§` (forms are atoms).
-    QualifiedForm,
     DuplicatePrimary,
+    /// The form is already a label of this overlay (v4.1).
+    DuplicateLabel,
     DuplicateSynonym,
     InvalidDisplay,
     InvalidAttribute,
@@ -125,10 +135,10 @@ impl fmt::Display for DtiErrorKind {
             Self::UnexpectedField => f.write_str("unexpected positional field"),
             Self::InvalidKey(err) => write!(f, "{err}"),
             Self::DuplicateKey(key) => write!(f, "duplicate key {key}"),
-            Self::InvalidForm => f.write_str("lexical form is not a valid glyph path"),
-            Self::QualifiedForm => {
-                f.write_str("lexical form contains '§': DTI forms are single atoms")
-            }
+            Self::InvalidForm => f.write_str(
+                "lexical form is not a glyph token (invisible character, or the operator `~` / `~~`)",
+            ),
+            Self::DuplicateLabel => f.write_str("label form already censused in this overlay"),
             Self::DuplicatePrimary => f.write_str("primary form already used in this language"),
             Self::DuplicateSynonym => f.write_str("duplicate synonym in the same record"),
             Self::InvalidDisplay => f.write_str("invalid display form"),
@@ -192,14 +202,21 @@ impl Sink {
 
 // ═══════════════════════════ Lexical layer ═══════════════════════════
 
-/// Splits a record line into fields, honouring `"…"` quoted values.
+/// `true` for the tag fields whose value may be quoted (`display:`, `attr:`).
+fn quotable(field_start: &str) -> bool {
+    field_start.starts_with("display:") || field_start.starts_with("attr:")
+}
+
+/// Splits a record line into fields. `"…"` quoting is honoured only inside the
+/// `display:` and `attr:` fields; every other field ends at the next space.
 fn fields(line: &str) -> Result<Vec<&str>, DtiErrorKind> {
     let mut out = Vec::new();
     let mut start = 0_usize;
     let mut quoted = false;
+    let mut quoting = line.get(start..).is_some_and(quotable);
     for (index, ch) in line.char_indices() {
         match ch {
-            '"' => quoted = !quoted,
+            '"' if quoting => quoted = !quoted,
             ' ' if !quoted => {
                 let field = line.get(start..index).ok_or(DtiErrorKind::EmptyField)?;
                 if field.is_empty() {
@@ -207,6 +224,7 @@ fn fields(line: &str) -> Result<Vec<&str>, DtiErrorKind> {
                 }
                 out.push(field);
                 start = index.saturating_add(1);
+                quoting = line.get(start..).is_some_and(quotable);
             }
             _ => {}
         }
@@ -222,18 +240,9 @@ fn fields(line: &str) -> Result<Vec<&str>, DtiErrorKind> {
     Ok(out)
 }
 
-/// Same character policy as raw strings (D9): no control or format/bidi characters.
+/// Same character policy as glyphs (D9): no control or format/bidi characters.
 fn is_forbidden_text_character(ch: char) -> bool {
-    ch.is_control()
-        || matches!(
-            ch,
-            '\u{061C}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{FEFF}'
-        )
+    crate::glyph::is_invisible_character(ch)
 }
 
 fn unquote(value: &str) -> Result<&str, DtiErrorKind> {
@@ -249,26 +258,24 @@ fn parse_key(text: &str) -> Result<DtiKey, DtiErrorKind> {
     DtiKey::parse(text).map_err(DtiErrorKind::InvalidKey)
 }
 
-pub(super) struct FormValidator {
-    scratch: Interner,
-}
+pub(super) struct FormValidator;
 
 impl FormValidator {
-    /// A lexical form (primary, `form:`, `syn:`) must be a single glyph atom (Q7,
-    /// §7): `§` is the structural qualifier of the grammar and never belongs to a
-    /// DTI form, so the `§` structure is isomorphic between the lexical and the
-    /// indexed form. Human multiword forms use `display:`, conceptual composition
-    /// uses `base:` / `param:`.
+    /// A lexical form (primary, `form:`, `syn:`, label) is any glyph token
+    /// (v4.1): any visible character, `§` included (a form containing `§` is
+    /// looked up whole before any segment resolution), except the two exact
+    /// anaphora operators `~` and `~~` and the invisible characters (D9).
+    /// Human multiword forms use `display:`.
     fn check(&mut self, form: &str) -> Result<(), DtiErrorKind> {
-        if form.contains('"') || form.contains('~') {
+        if form.is_empty()
+            || form.contains(' ')
+            || form == crate::ast::SEMA_ANAPHORA_MARK
+            || (form.len() == crate::ast::ANAPHORA_MARK.len_utf8()
+                && form.starts_with(crate::ast::ANAPHORA_MARK))
+        {
             return Err(DtiErrorKind::InvalidForm);
         }
-        if form.contains(crate::ast::QUALIFIER_SEPARATOR) {
-            return Err(DtiErrorKind::QualifiedForm);
-        }
-        crate::glyph::parse_path(form, &mut self.scratch)
-            .map(|_| ())
-            .map_err(|_| DtiErrorKind::InvalidForm)
+        crate::glyph::check_glyph_text(form).map_err(|_| DtiErrorKind::InvalidForm)
     }
 }
 
@@ -351,7 +358,7 @@ pub(super) fn check_attr(name: &str, content: &str) -> Result<(), DtiErrorKind> 
 }
 
 /// Shared per-record checks of the text parser and of the `.dti.bin` decoder:
-/// tags allowed by the record kind, atomic glyph forms (`QualifiedForm`), unique
+/// tags allowed by the record kind, glyph-token forms, unique
 /// synonyms, display and attribute forms.
 pub(super) fn validate_record_fields(
     record: &RawRecord,
@@ -413,11 +420,14 @@ pub(super) enum RecordKind {
     Rec,
     Use,
     New,
+    /// `label <KEY> <form>` (local only, no tags, v4.1).
+    Label,
 }
 
 impl RecordKind {
     fn allows(self, tag: &str) -> bool {
         match self {
+            Self::Label => false,
             Self::Rec => matches!(
                 tag,
                 "display" | "syn" | "base" | "param" | "morph" | "superseded_by" | "attr"
@@ -493,6 +503,7 @@ fn parse_record(
         Some("rec") => RecordKind::Rec,
         Some("use") => RecordKind::Use,
         Some("new") => RecordKind::New,
+        Some("label") => RecordKind::Label,
         _ => return Err(DtiErrorKind::UnknownRecordKind),
     };
     let key = parse_key(
@@ -502,7 +513,7 @@ fn parse_record(
     )?;
     let primary = match kind {
         RecordKind::Use => None,
-        RecordKind::Rec | RecordKind::New => {
+        RecordKind::Rec | RecordKind::New | RecordKind::Label => {
             let form = iter
                 .next()
                 .copied()
@@ -872,7 +883,23 @@ pub(super) fn build_overlay(
     let mut enabled: BTreeSet<DtiKey> = BTreeSet::new();
     let mut local: BTreeMap<DtiKey, ConceptRecord> = BTreeMap::new();
     let mut lexicon = Lexicon::default();
+    let mut labels = LabelLexicon::default();
+    let mut census_warnings: Vec<CensusWarning> = Vec::new();
     let mut local_lines: Vec<(u32, DtiKey)> = Vec::new();
+    // v4.1: warns when a local form is the exchange-language primary form of
+    // another universal glyph.
+    let mut census = |line: u32, kind: CensusKind, form: &str, own: Option<DtiKey>| {
+        if let Some(universal_key) = universal.lexicon.primary(form) {
+            if own != Some(universal_key) {
+                census_warnings.push(CensusWarning {
+                    line,
+                    kind,
+                    form: Box::from(form),
+                    universal: universal_key,
+                });
+            }
+        }
+    };
 
     for record in records {
         let RawRecord {
@@ -898,6 +925,7 @@ pub(super) fn build_overlay(
                     continue;
                 }
                 if let Some(form) = tags.form {
+                    census(line, CensusKind::Glyph, &form, Some(key));
                     let entry = LexicalEntry {
                         key,
                         primary: form,
@@ -921,10 +949,15 @@ pub(super) fn build_overlay(
                     sink.report(line, DtiErrorKind::DuplicateKey(key));
                     continue;
                 }
+                if labels.contains_key(&key) {
+                    sink.report(line, DtiErrorKind::DuplicateKey(key));
+                    continue;
+                }
                 let Some(primary) = primary else {
                     sink.report(line, DtiErrorKind::MissingField { name: "primary" });
                     continue;
                 };
+                census(line, CensusKind::Glyph, &primary, None);
                 let entry = LexicalEntry {
                     key,
                     primary,
@@ -947,6 +980,26 @@ pub(super) fn build_overlay(
                     },
                 );
                 local_lines.push((line, key));
+            }
+            RecordKind::Label => {
+                if universal.concepts.contains_key(&key) {
+                    sink.report(line, DtiErrorKind::LocalShadowsUniversal(key));
+                    continue;
+                }
+                if local.contains_key(&key) || enabled.contains(&key) {
+                    sink.report(line, DtiErrorKind::DuplicateKey(key));
+                    continue;
+                }
+                let Some(form) = primary else {
+                    sink.report(line, DtiErrorKind::MissingField { name: "primary" });
+                    continue;
+                };
+                census(line, CensusKind::Label, &form, None);
+                if labels.contains_key(&key) {
+                    sink.report(line, DtiErrorKind::DuplicateKey(key));
+                } else if !labels.insert(key, form) {
+                    sink.report(line, DtiErrorKind::DuplicateLabel);
+                }
             }
         }
     }
@@ -975,15 +1028,15 @@ pub(super) fn build_overlay(
         enabled,
         local,
         lexicon,
+        labels,
+        census_warnings,
     })
 }
 
 // ═══════════════════════════ Entry points ═══════════════════════════
 
-pub(super) fn form_validator() -> FormValidator {
-    FormValidator {
-        scratch: Interner::new(),
-    }
+pub(super) const fn form_validator() -> FormValidator {
+    FormValidator
 }
 
 pub(super) const fn new_sink(source: DtiSource) -> Sink {
@@ -1088,6 +1141,11 @@ impl Dti {
                 if !overlay.local.contains_key(&base) && !universal.concepts.contains_key(&base) {
                     sink.report(0, DtiErrorKind::OrphanReference(base));
                 }
+            }
+        }
+        for (key, _) in overlay.labels.iter() {
+            if universal.concepts.contains_key(&key) {
+                sink.report(0, DtiErrorKind::LocalShadowsUniversal(key));
             }
         }
         let base_of = |key: &DtiKey| {

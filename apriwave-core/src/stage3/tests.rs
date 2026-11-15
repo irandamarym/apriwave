@@ -1,11 +1,13 @@
 //! Phase C tests: expanded rendering, indexed wire form, indexed input, views.
 
+use crate::analyze::{ClauseId, GlobalClause, SlotIndex, SlotRef};
 use crate::dti::{Dti, DtiKey, KeyResolution};
-use crate::session::{PeriodId, Session};
+use crate::session::{PeriodId, Session, SlotKind};
 
 use super::{
-    render_expanded_period, render_indexed_period, render_view, validate_indexed_input,
-    ExpandError, IndexError, IndexedInputError, Layout, MorphFlag, ResolveError, ViewDisplayMode,
+    receive_indexed_input, render_expanded_period, render_indexed_period, render_view,
+    validate_indexed_input, ExpandError, IndexError, IndexedInputError, IndexedLabel, LabelSubtype,
+    Layout, MorphFlag, NewLabelSubtype, ResolveError, ViewDisplayMode,
 };
 
 type TestResult = Result<(), String>;
@@ -133,47 +135,29 @@ fn multi_valued_variable_in_case_pair_expands_with_absi() -> TestResult {
 }
 
 #[test]
-fn renders_sema_anaphora_as_glyph_reference() -> TestResult {
-    // `~~` in a case slot: the signal glyph of the antecedent.
+fn sema_anaphora_stays_as_written_v4_1() -> TestResult {
+    // v4.1: `~~` stays `~~` in every even slot (removing `def` and portability
+    // blocks never changes the latest complete sema).
+    for (what, src) in [
+        ("case slot", "/^ ta x nu a : ta b a ~~ ^/"),
+        ("signal slot", "/^ ta x nu a : tozato ~~ ^/"),
+        ("sema of a sema", "/^ ta x nu a : tozato ~~ :: tazato ~~ ^/"),
+        ("with case pairs", "/^ ta x nu a : tozato ~~ nu b ^/"),
+    ] {
+        check(what, expanded(src)?, src.to_owned())?;
+        idempotent(src)?;
+    }
+    // A glyph anaphora is substituted, a sema anaphora is kept.
     check(
-        "latest in a case slot",
-        expanded("/^ ta x nu a : ta b a ~~ ^/")?,
-        "/^ ta x nu a : ta b a x~~ ^/".to_owned(),
+        "mixed",
+        expanded("/^ ta vedere nu io : ta abbaiare nu ~ :: ta pensare a ~~ ^/")?,
+        "/^ ta vedere nu io : ta abbaiare nu io :: ta pensare a ~~ ^/".to_owned(),
     )?;
+    // `vedere~~` is an ordinary glyph.
     check(
-        "by glyph in a case slot",
-        expanded("/^ ta vedere nu io : ta abbaiare nu ~ :: ta pensare a vedere~~ ^/")?,
-        "/^ ta vedere nu io : ta abbaiare nu io :: ta pensare a vedere~~ ^/".to_owned(),
-    )?;
-    idempotent("/^ ta x nu a : ta b a ~~ ^/")
-}
-
-#[test]
-fn sema_in_signal_slot_is_rendered_like_any_slot() -> TestResult {
-    // Every even slot follows the same rule: `~~` → `<signal glyph>~~`.
-    let src = "/^ ta x nu a : tozato ~~ ^/";
-    check(
-        "latest",
-        expanded(src)?,
-        "/^ ta x nu a : tozato x~~ ^/".to_owned(),
-    )?;
-    idempotent(src)?;
-    check(
-        "written glyph~~ stays as written",
-        expanded("/^ ta vedere nu io : ta abbaiare nu canis :: tazato vedere~~ abfi ieri ^/")?,
-        "/^ ta vedere nu io : ta abbaiare nu canis :: tazato vedere~~ abfi ieri ^/".to_owned(),
-    )?;
-    // The antecedent's signal glyph is itself a sema: first glyph path in
-    // canonical order, `~~` when there is none.
-    check(
-        "sema of a sema",
-        expanded("/^ ta x nu a : tozato ~~ :: tazato ~~ ^/")?,
-        "/^ ta x nu a : tozato x~~ :: tazato ~~ ^/".to_owned(),
-    )?;
-    check(
-        "case pairs are never copied",
-        expanded("/^ ta x nu a : tozato ~~ nu b ^/")?,
-        "/^ ta x nu a : tozato x~~ nu b ^/".to_owned(),
+        "suffixed glyph",
+        expanded("/^ ta vedere nu io : tazato vedere~~ abfi ieri ^/")?,
+        "/^ ta vedere nu io : tazato vedere~~ abfi ieri ^/".to_owned(),
     )
 }
 
@@ -269,6 +253,8 @@ fn dti() -> Result<Dti, String> {
         k("greenemerald")?,
         k("green")?
     ));
+    // v4.1: a DTI form may contain `§` (one glyph, one key).
+    universal.push_str(&format!("rec {} red§wine\n", k("redwine")?));
     let mut local = String::from("#awdti 1\n#role local\n#universal 7\n#lang it\n");
     for key in &digits {
         local.push_str(&format!("use {key}\n"));
@@ -291,6 +277,10 @@ fn dti() -> Result<Dti, String> {
     ));
     local.push_str(&format!("use {} form:porta syn:uscio\n", k("door")?));
     local.push_str(&format!("use {} form:portare syn:uscio\n", k("carry")?));
+    local.push_str(&format!("use {}\n", k("redwine")?));
+    // v4.1 labels: `verde` is also a glyph (homonymy).
+    local.push_str(&format!("label {} Roma\n", k("labelroma")?));
+    local.push_str(&format!("label {} verde\n", k("labelverde")?));
     Dti::load(&universal, &local).map_err(|d| format!("{d:#?}"))
 }
 
@@ -488,14 +478,14 @@ fn indexed_form_is_independent_of_the_expanded_form() -> TestResult {
     check(
         "def blocks kept, names indexed",
         indexed(
-            "/^ defu io a sensore y defu io absi verde y ta io nu canis ^/",
+            "/^ defu io a sensore y defu io absi ottico y ta io nu canis ^/",
             &dti,
         )?,
         Ok(format!(
             "/^ defu {i} a {s} y defu {i} absi {g} y ta {i} nu {d} ^/",
             i = k("i")?,
             s = k("sensor")?,
-            g = k("green")?,
+            g = k("optical")?,
             d = k("dog")?
         )),
     )?;
@@ -515,46 +505,26 @@ fn indexed_form_is_independent_of_the_expanded_form() -> TestResult {
         )),
     )?;
     check(
-        "anaphora bases",
+        "anaphora operators kept",
         indexed(
-            "/^ ta vedere nu sensore§ottico : ta abbaiare nu sensore~ ^/",
+            "/^ ta vedere nu sensore§ottico : ta abbaiare nu ~ :: tozato ~~ ^/",
             &dti,
         )?,
         Ok(format!(
-            "/^ ta {see} nu {s}§{o} : ta {b} nu {s}~ ^/",
+            "/^ ta {see} nu {s}§{o} : ta {b} nu ~ :: tozato ~~ ^/",
             see = k("see")?,
             s = k("sensor")?,
             o = k("optical")?,
             b = k("bark")?
         )),
     )?;
+    // v4.1: `sensore~` is an ordinary glyph, unknown to the DTI.
     check(
-        "inverse anaphora atoms",
-        indexed(
-            "/^ ta vedere nu sensore : ta abbaiare nu sensore§ottico~ ^/",
-            &dti,
-        )?,
-        Ok(format!(
-            "/^ ta {see} nu {s} : ta {b} nu {s}§{o}~ ^/",
-            see = k("see")?,
-            s = k("sensor")?,
-            o = k("optical")?,
-            b = k("bark")?
-        )),
-    )?;
-    check(
-        "sema by glyph",
-        indexed(
-            "/^ ta vedere nu io : ta abbaiare nu canis :: tozato vedere~~ ^/",
-            &dti,
-        )?,
-        Ok(format!(
-            "/^ ta {see} nu {i} : ta {b} nu {d} :: tozato {see}~~ ^/",
-            see = k("see")?,
-            i = k("i")?,
-            b = k("bark")?,
-            d = k("dog")?
-        )),
+        "suffixed glyph",
+        indexed("/^ ta vedere nu io : ta abbaiare nu sensore~ ^/", &dti)?,
+        Err(IndexError::Resolve(ResolveError::UnknownForm {
+            form: "sensore~".to_owned(),
+        })),
     )?;
     let (session, id) = one("/^ ta vedere nu io : tozato ~~ ^/")?;
     check(
@@ -604,8 +574,8 @@ fn bound_symbols_use_dti_or_ephemeral_keys() -> TestResult {
             see = k("see")?,
         )),
     )?;
-    // D2: qualified anchor id, atom by atom (`porta` enabled, `uno` ephemeral).
-    let uno = DtiKey::session_symbol("uno").map_err(|e| e.to_string())?;
+    // v4.1: an anchor id is the whole glyph token (one session symbol).
+    let port = DtiKey::session_symbol("porta§uno").map_err(|e| e.to_string())?;
     check(
         "qualified anchor id",
         indexed(
@@ -613,7 +583,22 @@ fn bound_symbols_use_dti_or_ephemeral_keys() -> TestResult {
             &dti,
         )?,
         Ok(format!(
-            "/^ ta {see} nu {i} : anchorrel {door}§{uno} : ta {b} nu {d} : reloff {door}§{uno} : end ~ ^/",
+            "/^ ta {see} nu {i} : anchorrel {port} : ta {b} nu {d} : reloff {port} : end ~ ^/",
+            see = k("see")?,
+            i = k("i")?,
+            b = k("bark")?,
+            d = k("dog")?,
+        )),
+    )?;
+    // An enabled primary form as anchor id keeps its DTI key.
+    check(
+        "anchor id with a DTI key",
+        indexed(
+            "/^ ta vedere nu io : anchor porta : ta abbaiare nu canis : end ~ ^/",
+            &dti,
+        )?,
+        Ok(format!(
+            "/^ ta {see} nu {i} : anchor {door} : ta {b} nu {d} : end ~ ^/",
             see = k("see")?,
             i = k("i")?,
             door = k("door")?,
@@ -688,9 +673,9 @@ fn validates_indexed_input() -> TestResult {
 #[test]
 fn validates_every_indexed_operand() -> TestResult {
     let dti = dti()?;
-    // def name and values, portability id, anaphora bases: all keys are checked.
+    // def name and values, portability id: all keys are checked.
     let text = format!(
-        "/^ defu {i} a {s}§{o} y ta {see} nu {i} : anchor {door} : ta {b} nu {s}~ : end ~ ^/",
+        "/^ defu {i} a {s}§{o} y ta {see} nu {i} : anchor {door} : ta {b} nu ~ : end ~ ^/",
         i = k("i")?,
         s = k("sensor")?,
         o = k("optical")?,
@@ -702,7 +687,7 @@ fn validates_every_indexed_operand() -> TestResult {
     let report = validate_indexed_input(&session, id, &dti).map_err(|e| format!("{e:#?}"))?;
     // Bound symbols (def name `i`, its reference, anchor id) are session symbols:
     // accepted as valid keys, not resolved against the static DTI.
-    check("entries", report.entries.len(), 5)?;
+    check("entries", report.entries.len(), 4)?;
     // A def name is a session symbol: a key unknown to the DTI is accepted there
     // (and in its references), but not in an ordinary slot.
     let dev = DtiKey::session_symbol("dev").map_err(|e| e.to_string())?;
@@ -818,5 +803,208 @@ fn views_in_every_mode() -> TestResult {
     ) {
         Err(super::ViewError::MissingDti) => Ok(()),
         other => Err(format!("expected MissingDti, got {other:?}")),
+    }
+}
+
+// ═══════════════════════════ Labels and `§` priority (v4.1) ═══════════════════════════
+
+fn slot(period: PeriodId, clause: u32, position: u32) -> SlotRef {
+    SlotRef {
+        clause: GlobalClause {
+            period,
+            clause: ClauseId::new(clause),
+        },
+        slot: SlotIndex::new(position),
+    }
+}
+
+#[test]
+fn whole_token_first_then_segments_v4_1() -> TestResult {
+    let dti = dti()?;
+    check(
+        "censused form with §",
+        indexed("/^ ta vedere nu red§wine ^/", &dti)?,
+        Ok(format!("/^ ta {} nu {} ^/", k("see")?, k("redwine")?)),
+    )?;
+    check(
+        "segments",
+        indexed("/^ ta vedere nu sensore§ottico ^/", &dti)?,
+        Ok(format!(
+            "/^ ta {} nu {}§{} ^/",
+            k("see")?,
+            k("sensor")?,
+            k("optical")?
+        )),
+    )?;
+    check(
+        "empty segment",
+        indexed("/^ ta vedere nu sensore§ ^/", &dti)?,
+        Err(IndexError::Resolve(ResolveError::UnknownForm {
+            form: "sensore§".to_owned(),
+        })),
+    )
+}
+
+#[test]
+fn labels_travel_as_lvaaaa_v4_1() -> TestResult {
+    let dti = dti()?;
+    // Without a selection every slot is a glyph (programmatic / CLI flows).
+    check(
+        "unmarked label form is a glyph",
+        indexed("/^ ta vedere nu Roma ^/", &dti)?,
+        Err(IndexError::Resolve(ResolveError::UnknownForm {
+            form: "Roma".to_owned(),
+        })),
+    )?;
+    check(
+        "unmarked glyph-and-label form is a glyph",
+        indexed("/^ ta vedere nu verde ^/", &dti)?,
+        Ok(format!("/^ ta {} nu {} ^/", k("see")?, k("green")?)),
+    )?;
+    // The mandatory selection decides.
+    for (text, kind, want) in [
+        ("verde", SlotKind::Label, "LVAAAAverde".to_owned()),
+        ("verde", SlotKind::Glyph, k("green")?),
+        ("Roma", SlotKind::Label, "LVAAAARoma".to_owned()),
+        // A label choice on a form absent from the DTI is honoured.
+        ("Milano", SlotKind::Label, "LVAAAAMilano".to_owned()),
+    ] {
+        let (mut session, id) = one(&format!("/^ ta vedere nu {text} ^/"))?;
+        check(
+            "choice recorded",
+            session.set_slot_kind(slot(id, 0, 1), kind),
+            true,
+        )?;
+        check("choice", session.effective_slot_kind(slot(id, 0, 1)), kind)?;
+        check(
+            "chosen kind on the wire",
+            render_indexed_period(&session, id, &dti),
+            Ok(format!("/^ ta {} nu {want} ^/", k("see")?)),
+        )?;
+    }
+    // A choice is recorded only on a glyph token.
+    let (mut session, id) = one("/^ ta vedere nu io : ta abbaiare nu ~ ^/")?;
+    check(
+        "no choice on an anaphora",
+        session.set_slot_kind(slot(id, 1, 1), SlotKind::Label),
+        false,
+    )?;
+    check(
+        "default kind",
+        session.effective_slot_kind(slot(id, 0, 1)),
+        SlotKind::Glyph,
+    )?;
+    // A token already in wire-label form is kept verbatim, subtype included.
+    check(
+        "wire label verbatim",
+        indexed("/^ ta vedere nu LVAXYZroma ^/", &dti)?,
+        Ok(format!("/^ ta {} nu LVAXYZroma ^/", k("see")?)),
+    )
+}
+
+#[test]
+fn receiver_treats_lva_tokens_as_labels_v4_1() -> TestResult {
+    let dti = dti()?;
+    let text = format!(
+        "/^ ta {} nu LVAAAAverde a LVAAAAMilano d LVAXYZroma g LVAXYZpisa ^/",
+        k("see")?
+    );
+    let (mut session, id) = one(&text)?;
+    let report = validate_indexed_input(&session, id, &dti).map_err(|e| format!("{e:#?}"))?;
+    check("entries", report.entries.len(), 1)?;
+    check(
+        "labels",
+        report.labels,
+        vec![
+            IndexedLabel {
+                slot: slot(id, 0, 1),
+                form: "verde".to_owned(),
+                subtype: LabelSubtype::Known(*b"AAA"),
+                homonym: true,
+            },
+            IndexedLabel {
+                slot: slot(id, 0, 2),
+                form: "Milano".to_owned(),
+                subtype: LabelSubtype::Known(*b"AAA"),
+                homonym: false,
+            },
+            IndexedLabel {
+                slot: slot(id, 0, 3),
+                form: "roma".to_owned(),
+                subtype: LabelSubtype::Dynamic(*b"XYZ"),
+                homonym: false,
+            },
+            IndexedLabel {
+                slot: slot(id, 0, 4),
+                form: "pisa".to_owned(),
+                subtype: LabelSubtype::Dynamic(*b"XYZ"),
+                homonym: false,
+            },
+        ],
+    )?;
+    // An unknown subtype is never an error: one informative note, registered
+    // dynamically on receipt.
+    check(
+        "new subtype note",
+        report.new_subtypes,
+        vec![NewLabelSubtype {
+            slot: slot(id, 0, 3),
+            code: *b"XYZ",
+        }],
+    )?;
+    let report = receive_indexed_input(&mut session, id, &dti).map_err(|e| format!("{e:#?}"))?;
+    check("still reported once", report.new_subtypes.len(), 1)?;
+    check(
+        "registered",
+        session.label_subtypes().collect::<Vec<_>>(),
+        vec![*b"XYZ"],
+    )?;
+    check(
+        "label slots marked",
+        session.effective_slot_kind(slot(id, 0, 3)),
+        SlotKind::Label,
+    )?;
+    // Re-rendering keeps every label verbatim, subtype included.
+    let rendered = render_indexed_period(&session, id, &dti).map_err(|e| e.to_string())?;
+    check("re-rendered", rendered.as_str(), text.as_str())?;
+    // Next message: the subtype is known.
+    let ids = session
+        .ingest(&format!("/^ ta {} nu LVAXYZlucca ^/", k("see")?))
+        .map_err(|d| format!("{d:#?}"))?;
+    let next = ids.first().copied().ok_or("no period")?;
+    let report = validate_indexed_input(&session, next, &dti).map_err(|e| format!("{e:#?}"))?;
+    check(
+        "known now",
+        report.labels.first().map(|l| l.subtype),
+        Some(LabelSubtype::Known(*b"XYZ")),
+    )?;
+    check("no new subtype", report.new_subtypes.len(), 0)?;
+    // The table survives compaction after a hard close.
+    session
+        .ingest(&format!("/^ ta {} ^^/", k("see")?))
+        .map_err(|d| format!("{d:#?}"))?;
+    session.compact().map_err(|e| e.to_string())?;
+    check(
+        "kept after compact",
+        session.is_known_label_subtype(*b"XYZ"),
+        true,
+    )?;
+    // Only truncated or corrupted tokens are malformed.
+    let text = format!("/^ ta {} nu LVAAA a LVAabcx d LVAAAA ^/", k("see")?);
+    let (session, id) = one(&text)?;
+    match validate_indexed_input(&session, id, &dti) {
+        Err(errors) => check(
+            "malformed labels",
+            errors,
+            ["LVAAA", "LVAabcx", "LVAAAA"]
+                .iter()
+                .zip(1_u32..)
+                .map(|(token, position)| IndexedInputError::MalformedLabel {
+                    slot: slot(id, 0, position),
+                    token: (*token).to_owned(),
+                })
+                .collect(),
+        ),
+        Ok(report) => Err(format!("accepted: {report:?}")),
     }
 }

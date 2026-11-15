@@ -1,4 +1,4 @@
-//! Phase A tests: D9 (forbidden characters in raw strings), deterministic JSON
+//! Phase A tests: D9 (invisible characters in glyphs), deterministic JSON
 //! export, Functions contract (D12).
 
 use crate::analyze::{ClauseId, GlobalClause, SlotIndex, SlotRef};
@@ -83,19 +83,20 @@ fn well_formed(json: &str) -> TestResult {
 // ═══════════════════════════ D9 ═══════════════════════════
 
 #[test]
-fn raw_strings_reject_control_and_bidi_characters_d9() -> TestResult {
+fn glyphs_reject_control_and_bidi_characters_d9() -> TestResult {
     for ch in [
         '\u{1B}', '\u{0}', '\u{7F}', '\u{90}', '\u{202E}', '\u{2066}', '\u{200B}', '\u{FEFF}',
     ] {
         expect_kind(
-            &format!("/^ ta log nu \"ab{ch}cd\" ^/"),
+            &format!("/^ ta log nu ab{ch}cd ^/"),
             DiagnosticKind::MalformedGlyph {
-                fault: GlyphFault::ForbiddenRawCharacter { ch },
+                fault: GlyphFault::InvisibleCharacter { ch },
             },
             ErrorCode::Syntax,
         )?;
     }
-    // Uppercase letters, punctuation, backslashes and printable Unicode remain allowed.
+    // v4.1: uppercase letters, quotes, punctuation, backslashes and printable
+    // Unicode are allowed in glyphs.
     let mut session = Session::new();
     accept(
         &mut session,
@@ -113,7 +114,15 @@ fn export_example_5_resolutions() -> TestResult {
     let json = json_of(EXAMPLE_5)?;
     well_formed(&json)?;
     contains(&json, "\"roots\":[0,2]")?;
-    contains(&json, "{\"id\":2,\"conj\":\"sed\",\"members\":[0,1]}")?;
+    // v4.1: no coordination tree, each clause carries its own conjunction.
+    contains(
+        &json,
+        "\"index\":2,\"kind\":\"relational\",\"role\":\"normal\",\"depth\":0,\"conjunction\":\"sed\"",
+    )?;
+    if json.contains("coordination") || json.contains("groups") {
+        return Err("coordination structures are gone in v4.1".to_owned());
+    }
+    contains(&json, "\"warnings\":[]")?;
     contains(
         &json,
         "\"resolution\":{\"kind\":\"glyph_anaphora\",\"antecedent\":{\"period\":0,\"clause\":0,\"position\":2}}",
@@ -144,7 +153,7 @@ fn export_definition_portability_and_escaping() -> TestResult {
     well_formed(&json)?;
     contains(&json, "\"kind\":\"definition\"")?;
     contains(&json, "\"op\":\"assign\",\"tile\":\"a\"")?;
-    contains(&json, "\"kind\":\"raw\",\"text\":\"a\\\\b\"")?;
+    contains(&json, "\"kind\":\"glyph\",\"text\":\"\\\"a\\\\b\\\"\"")?;
     contains(
         &json,
         "\"kind\":\"variable\",\"binding\":0,\"name\":\"dev\",\"number\":\"singular\"",
@@ -267,4 +276,39 @@ fn invalid_function_output_leaves_session_untouched() -> TestResult {
     } else {
         Err("the session was modified".to_owned())
     }
+}
+
+#[test]
+fn export_inheritance_slot_kinds_and_warnings_v4_1() -> TestResult {
+    let mut session = Session::new();
+    let ids = accept(&mut session, "/^ tachazatou x nu y a z : ta k nu w ^/")?;
+    let id = ids.first().copied().ok_or("no period")?;
+    let slot = SlotRef {
+        clause: GlobalClause {
+            period: id,
+            clause: ClauseId::new(1),
+        },
+        slot: SlotIndex::new(1),
+    };
+    if !session.set_slot_kind(slot, crate::SlotKind::Label) {
+        return Err("choice not recorded".to_owned());
+    }
+    let json = export_analyzed_json(&session, id).map_err(|e| e.to_string())?;
+    well_formed(&json)?;
+    contains(
+        &json,
+        "\"comparative\":\"cha\",\"comparative_inherited\":true",
+    )?;
+    contains(&json, "\"number\":\"u\",\"number_inherited\":true")?;
+    contains(&json, "\"slot_kind\":\"label\"")?;
+    // Downgraded diagnostics appear as warnings.
+    let config = crate::ParserConfig {
+        warnings: crate::WarningCodes::NONE.with(crate::ErrorCode::Scope),
+        ..crate::ParserConfig::default()
+    };
+    let mut session = Session::with_config(config);
+    let ids = accept(&mut session, "/^ quata x ^/")?;
+    let id = ids.first().copied().ok_or("no period")?;
+    let json = export_analyzed_json(&session, id).map_err(|e| e.to_string())?;
+    contains(&json, "\"warnings\":[{\"code\":\"ERR_SCOPE\"")
 }

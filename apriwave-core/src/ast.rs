@@ -1,4 +1,4 @@
-//! ApriWave v4.0 AST, stage 1: faithful syntactic form, no resolution.
+//! ApriWave v4.1 AST, stage 1: faithful syntactic form, no resolution.
 //!
 //! Principles:
 //! 1. **Illegal states are unrepresentable**: `def` without determiners, `taaltzato`,
@@ -260,7 +260,7 @@ impl RelationalBlock {
 
 /// `def` block (Q11). Surface identical to a relational block
 /// (`[def…] [glyph] { [case] [glyph] }`), but typed so that the constraints the
-/// `def` tile imposes on its own pairs (Q11: atomic glyph as name, at least
+/// `def` tile imposes on its own pairs (Q11: a glyph token as name, at least
 /// one operation, only `a*`/`abfi`/`absi`/`abse ~`) are guaranteed by the type.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DefinitionBlock {
@@ -455,7 +455,8 @@ pub struct SignalDeterminers {
     /// Q5: temporal and conditional are mutually exclusive (a single slot).
     pub tense: Option<TemporalMode>,
     /// Quantum number of the signal pair (`tau`, `tam`, `tanum`, `deepallu`),
-    /// written only when explicit (rule 1B: never inherited, omitted = Dual).
+    /// as written (rule 1B, v4.1: when omitted, stage 2 inherits the parent
+    /// signal's number in a subordinate clause, otherwise Dual).
     pub number: Option<ExplicitNumber>,
 }
 
@@ -639,17 +640,6 @@ impl Case {
         }
     }
 
-    /// Case identity used for duplicate detection (Q21): the `abdur` count is part
-    /// of the tile, not of the case, so `abdur=3` and `abdur=5` are the same case.
-    pub const fn identity(self) -> Self {
-        match self {
-            Self::Ablative(Some(AblativeDeterminer::Dur(_))) => {
-                Self::Ablative(Some(AblativeDeterminer::Dur(None)))
-            }
-            other => other,
-        }
-    }
-
     /// `abdur` count, if this is a loop tile with `=<N>`.
     pub const fn loop_count(self) -> Option<LoopCount> {
         match self {
@@ -663,7 +653,8 @@ impl Case {
         matches!(self, Self::Ablative(Some(AblativeDeterminer::Dur(_))))
     }
 
-    /// Rank in the M§3.1 canonical order `n → a → d → g → ab` (Q21).
+    /// Rank in the M§3.1 canonical order `n → a → d → g → ab` (stable sort: equal
+    /// ranks keep the written order, v4.1).
     pub const fn canonical_rank(self) -> u8 {
         match self {
             Self::Nominative => 0,
@@ -784,53 +775,49 @@ impl From<Option<ExplicitNumber>> for QuantumNumber {
 
 // ═══════════════════════════ Glyph slot ═══════════════════════════
 
+/// Content of an even slot (v4.1, Slot Locking: `1 Tile -> 1 Glyph`). Every
+/// token in an even slot is a glyph, except the two exact anaphora operators
+/// `~` and `~~`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum GlyphSlot {
     Glyph(GlyphPath),
-    /// `"…"` (Q7): content without the quotes.
-    RawString(Symbol),
     GlyphAnaphora(GlyphAnaphora),
     SemaAnaphora(SemaAnaphora),
 }
 
-/// `glyph§attr1§attr2`. No prefix is reserved: every path is a DTI glyph.
+/// A glyph token. `text` is the whole token (any visible characters, `§`
+/// included): the DTI is searched for it first and it is the name of a `def`
+/// variable. `root` and `qualifiers` are its `§` segments (possibly empty), used
+/// when the whole token is not a DTI form (`glyph1§glyph2`).
 #[derive(Debug, PartialEq, Eq)]
 pub struct GlyphPath {
+    pub text: Symbol,
     pub root: Symbol,
     pub qualifiers: Box<[Symbol]>,
 }
 
 impl GlyphPath {
+    /// `true` when the token contains no `§`.
     pub fn is_atomic(&self) -> bool {
         self.qualifiers.is_empty()
     }
 }
 
-/// Q10: purely syntactic distinction.
+/// `~`: the last glyph, in canonical order, of the antecedent block.
 #[derive(Debug, PartialEq, Eq)]
 pub enum GlyphAnaphora {
     /// `~`
     Exact,
-    /// `base~`
-    Prefix { base: Symbol },
-    /// `base§mod~`
-    Inverse {
-        base: Symbol,
-        qualifiers: NonEmpty<Symbol>,
-    },
 }
 
+/// `~~`: the whole antecedent sema (block).
 #[derive(Debug, PartialEq, Eq)]
 pub enum SemaAnaphora {
     /// `~~`
     Latest,
-    /// `glyph~~`: most recent antecedent sema that contains the given glyph in any
-    /// of its pairs (qualifiers allowed — Q10).
-    ByGlyph { glyph: GlyphPath },
 }
 
 /// Lexical markers for anaphora and qualifiers.
 pub const QUALIFIER_SEPARATOR: char = '§';
 pub const ANAPHORA_MARK: char = '~';
 pub const SEMA_ANAPHORA_MARK: &str = "~~";
-pub const RAW_STRING_QUOTE: char = '"';

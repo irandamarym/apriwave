@@ -2,14 +2,15 @@
 //!
 //! Two distinct authorities are kept separate in memory:
 //! - [`UniversalSnapshot`]: read-only, replaceable as a whole on update;
-//! - [`LocalOverlay`]: enabled universal keys, local lexical forms, local concepts
-//!   and the unknown-key policy.
+//! - [`LocalOverlay`]: enabled universal keys, local lexical forms, local concepts,
+//!   local labels (`label` records, v4.1) and the unknown-key policy.
 //!
 //! [`Dti`] joins them for lookups without ever merging or rewriting either side.
 
 use crate::prelude::*;
 
 use alloc::collections::{BTreeMap, BTreeSet};
+use core::fmt;
 
 use super::key::DtiKey;
 
@@ -34,6 +35,93 @@ pub struct ConceptRecord {
     pub superseded_by: Option<DtiKey>,
     /// Opaque metadata `attr:k§v`, carried without interpretation (B8).
     pub attrs: Box<[(Box<str>, Box<str>)]>,
+}
+
+/// Local labels (`label <KEY> <form>`, v4.1): free tokens that are **not**
+/// glyphs. A label form is unique among labels; the same form may also be a
+/// glyph (`use` / `new`) of the same overlay: the editor then asks the user.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LabelLexicon {
+    by_key: BTreeMap<DtiKey, Box<str>>,
+    by_form: BTreeMap<Box<str>, DtiKey>,
+}
+
+impl LabelLexicon {
+    /// Inserts a label. Returns `false` (and leaves the lexicon unchanged) if the
+    /// key or the form is already a label.
+    pub(crate) fn insert(&mut self, key: DtiKey, form: Box<str>) -> bool {
+        if self.by_key.contains_key(&key) || self.by_form.contains_key(&form) {
+            return false;
+        }
+        self.by_form.insert(Box::from(&*form), key);
+        self.by_key.insert(key, form);
+        true
+    }
+
+    /// Key of the label `form`, if censused.
+    pub fn key(&self, form: &str) -> Option<DtiKey> {
+        self.by_form.get(form).copied()
+    }
+
+    /// Form of the label `key`, if censused.
+    pub fn form(&self, key: &DtiKey) -> Option<&str> {
+        self.by_key.get(key).map(|form| &**form)
+    }
+
+    pub(crate) fn contains_key(&self, key: &DtiKey) -> bool {
+        self.by_key.contains_key(key)
+    }
+
+    /// Every label `(key, form)`, in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (DtiKey, &str)> + '_ {
+        self.by_key.iter().map(|(key, form)| (*key, &**form))
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_key.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_key.is_empty()
+    }
+}
+
+/// What a local census record declares (v4.1 census warning).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CensusKind {
+    /// `use … form:` or `new`.
+    Glyph,
+    /// `label`.
+    Label,
+}
+
+/// Census warning (v4.1, never an error): a local glyph or label form that is
+/// already the primary form of another universal glyph in the exchange
+/// language, so that the user does not send a label without knowing that the
+/// glyph exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CensusWarning {
+    /// 1-based line of the record in the local file (`0` for a binary overlay
+    /// row without a line, or the record ordinal for a binary).
+    pub line: u32,
+    pub kind: CensusKind,
+    pub form: Box<str>,
+    /// Universal concept whose exchange-language primary form is `form`.
+    pub universal: DtiKey,
+}
+
+impl fmt::Display for CensusWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let what = match self.kind {
+            CensusKind::Glyph => "local glyph",
+            CensusKind::Label => "label",
+        };
+        write!(
+            f,
+            "[DTI local:{}] warning: {what} '{}' is already the universal glyph {}",
+            self.line, self.form, self.universal
+        )
+    }
 }
 
 /// Lexical forms of a concept in one language.
@@ -176,7 +264,10 @@ pub enum UnknownKeyPolicy {
 }
 
 /// Local overlay: user choices on top of the snapshot.
-#[derive(Debug, PartialEq, Eq)]
+///
+/// Equality compares the model only: census warnings are load diagnostics
+/// (their line numbers depend on the source, text or binary).
+#[derive(Debug)]
 pub struct LocalOverlay {
     pub(crate) universal_version: u64,
     pub(crate) language: Box<str>,
@@ -184,7 +275,23 @@ pub struct LocalOverlay {
     pub(crate) enabled: BTreeSet<DtiKey>,
     pub(crate) local: BTreeMap<DtiKey, ConceptRecord>,
     pub(crate) lexicon: Lexicon,
+    pub(crate) labels: LabelLexicon,
+    pub(crate) census_warnings: Vec<CensusWarning>,
 }
+
+impl PartialEq for LocalOverlay {
+    fn eq(&self, other: &Self) -> bool {
+        self.universal_version == other.universal_version
+            && self.language == other.language
+            && self.policy == other.policy
+            && self.enabled == other.enabled
+            && self.local == other.local
+            && self.lexicon == other.lexicon
+            && self.labels == other.labels
+    }
+}
+
+impl Eq for LocalOverlay {}
 
 impl LocalOverlay {
     pub const fn universal_version(&self) -> u64 {
@@ -205,6 +312,17 @@ impl LocalOverlay {
 
     pub fn local_concept(&self, key: &DtiKey) -> Option<&ConceptRecord> {
         self.local.get(key)
+    }
+
+    /// Local labels (v4.1).
+    pub const fn labels(&self) -> &LabelLexicon {
+        &self.labels
+    }
+
+    /// Census warnings produced while loading the overlay (v4.1): forms that
+    /// are already universal glyphs in the exchange language.
+    pub fn census_warnings(&self) -> &[CensusWarning] {
+        &self.census_warnings
     }
 }
 
@@ -377,6 +495,11 @@ impl Dti {
                 KeyResolution::Unknown
             }
         }
+    }
+
+    /// Key of the local label `form`, if censused (v4.1).
+    pub fn label(&self, form: &str) -> Option<DtiKey> {
+        self.overlay.labels.key(form)
     }
 
     /// Primary form of a key: local language first, then exchange language.

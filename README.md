@@ -1,9 +1,10 @@
 # ApriWave
 
-**ApriWave (ApricotWave Protocol) v4.0** is a deterministic relational framework for
-machine-to-machine semantics. It is implemented in Rust as a **Sans-I/O** engine:
-it never touches the network, the clock or the file system on its own. It takes
-text in and returns structures, diagnostics and canonical text out.
+**ApriWave** (version **4.1**) is the Rust implementation of **GHLIP v4.1** (Grammatical Hierarchical
+Linear Inter-species Protocol), a deterministic relational protocol for
+machine-to-machine semantics. It is a **Sans-I/O** engine: it never touches the
+network, the clock or the file system on its own. It takes text in and returns
+structures, diagnostics and canonical text out.
 
 [![CI](https://github.com/irandamarym/apriwave/actions/workflows/ci.yml/badge.svg)](https://github.com/irandamarym/apriwave/actions/workflows/ci.yml)
 ![no_std](https://img.shields.io/badge/core-no__std%20%2B%20alloc-blue)
@@ -15,12 +16,14 @@ text in and returns structures, diagnostics and canonical text out.
 
 ## What it is
 
-ApriWave is **not** a natural language. A period is a sequence of `[Tile] [Glyph]`
+GHLIP is **not** a natural language. A period is a sequence of `[Tile] [Glyph]`
 pairs:
 
 - **Tiles** form a closed, fixed set of grammatical tools: signals, determiners,
   cases, numbers, connectors and period delimiters.
 - **Glyphs** are the content, and belong to a dictionary of concepts, the **DTI**.
+  A glyph may contain any visible character: by *Slot Locking* every token in an
+  even slot is a glyph, except the two anaphora operators `~` and `~~`.
 
 ```text
 /^ ta vedere nu io au canis : ta abbaiare nu ~ ^/
@@ -31,6 +34,59 @@ meaning of a glyph. Every valid string has exactly one structure. Loops
 (`abdur=<N>`) and set operations (`all`, `some`, `cup`, `cua`, `cuo`, …) are
 resolved by the engine into a validated, deterministic **execution plan**: the host
 only performs the physical effect.
+
+### What changes in v4.1
+
+The grammar is a mechanical, deterministic and neutral engine: it never judges the
+content of a glyph and guides the user without arbitrary bans.
+
+- Glyphs and DTI forms admit any visible character (`§` included: a censused
+  `a§b` is one glyph); only invisible control and format/bidi characters are
+  refused.
+- Labels replace the old quoted strings: `label <KEY> <form>` in the local DTI,
+  transmitted as `LVAAAA<form>`; the same form may be both a glyph and a label,
+  and the editor asks which one applies.
+- `ref` admits the Accusative and every comparative; repeated cases are allowed
+  with a stable canonical order; anaphora are only `~` and `~~`; coordination keeps
+  the written order; subordinates inherit every omitted determiner (number and
+  comparative included).
+- Several `abdur=<N>` loops nest in written order; the bare `abdur` marker accepts
+  an inherited conditional.
+- Each non-structural error code can be downgraded to a warning, at the user's own
+  risk (`ParserConfig::warnings`, `[warnings]` in `settings.toml`).
+- Editor: suggestion menu (`Alt+Down`), copy with anchors (`Ctrl+C` / `Alt+C`).
+
+## Nomenclature
+
+The name of the **projects and containers** (repository and Rust crates) is distinct
+from the name of the **protocol** and of the **program**.
+
+| Level | Project / container | Protocol / program |
+|---|---|---|
+| **Level 0** — structural and relational (this repository) | **ApriWave** (*Apricot Wave*): the ecosystem, this repository and the crates `apriwave-core` and `apriwave` | **GHLIP** (*Ghlip*): the deterministic Level-0 grammatical protocol |
+| **Level 1** — computational and inferential (second project of the ecosystem) | **Apricot Logic**: the twin project, separate from Level 0 | **LEMMA**: the logical, homoiconic program and engine |
+
+- **ApriWave** joins the historical tribute to *Apricot Computers* (ACT) with the
+  concept of a carrier wave and of the quantum wave function.
+- **GHLIP** is the technical acronym of **G**rammatical **H**ierarchical **L**inear
+  **I**nter-species **P**rotocol:
+  - **G — Grammatical:** closed, immutable frame of the *Universal Grammatical
+    Tiles* (*Tile Matrix*).
+  - **H — Hierarchical:** tree hierarchy without closing tags, based on *Dynamic
+    Stack Pruning* (`:`, `::`, `:::`).
+  - **L — Linear:** deterministic linear scan based on *Slot Locking*
+    (`1 Tile -> 1 Glyph`).
+  - **I — Inter-species:** neutral framework free of cognitive or anthropocentric
+    bias, born for inter-species contact logs and for deterministic M2M
+    communication through the DTI dictionary.
+  - **P — Protocol:** pure Level-0 protocol, separate from the computational layer.
+- **Terminology:** `GHLIP` (`Ghlip`) names the whole Level-0 protocol. A `glyph`
+  (Italian `glifo`, invariable in the plural in Italian: *i glifo*) is only the
+  single atomic element registered in the DTI dictionary, within the founding triad
+  *Tiles* + *Glyph* = *Sema*.
+- **LEMMA** operates on the `/^ ... ^/` periods already validated by `GHLIP`, and
+  interfaces with `apriwave-core` through the transactional hook
+  `FunctionEvaluator` (`Session::evaluate_and_ingest`).
 
 ## Architecture
 
@@ -152,9 +208,12 @@ has no dependencies.
 
 ## Documentation
 
-The normative reference for the grammar, the engine and every module is the
-technical manual, written in Italian:
-[`docs/Manuale_Tecnico_ApriWave_v4.0.md`](docs/Manuale_Tecnico_ApriWave_v4.0.md).
+The technical manual is the reference for the grammar, the engine and every module:
+
+- English: [`docs/Technical_Manual_ApriWave_v4.1_EN.md`](docs/Technical_Manual_ApriWave_v4.1_EN.md)
+- Italian (normative edition): [`docs/Manuale_Tecnico_ApriWave_v4.1.md`](docs/Manuale_Tecnico_ApriWave_v4.1.md)
+
+In case of discrepancy, the Italian edition prevails.
 
 ## License
 

@@ -6,8 +6,8 @@ use core::fmt;
 
 use crate::analyze::{GlobalClause, Resolution, SlotIndex, SlotRef};
 use crate::ast::{
-    ClauseRef, DefOperation, GlyphAnaphora, GlyphPath, GlyphSlot, Link, LinkedClause,
-    PortabilityBlock, SemaAnaphora, ANAPHORA_MARK,
+    ClauseRef, DefOperation, GlyphPath, GlyphSlot, Link, LinkedClause, PortabilityBlock,
+    ANAPHORA_MARK,
 };
 use crate::dti::{Dti, DtiKey, KeyError, KeyResolution};
 use crate::printer::{self, render_glyph_path, render_glyph_slot};
@@ -15,7 +15,9 @@ use crate::session::{PeriodId, Session};
 use crate::symbol::{Interner, Symbol};
 
 use super::indexed::{indexed_lines, IndexError};
+use super::label::{is_glyph_form, parse_label_wire, LabelSubtype};
 use super::resolve::{numeral, resolve_path, IndexedAtom, MorphFlag, PathResolution, ResolveError};
+use crate::session::SlotKind;
 
 // ═══════════════════════════ Indexed input (C.2) ═══════════════════════════
 
@@ -28,9 +30,34 @@ pub struct IndexedEntry {
     pub resolution: KeyResolution,
 }
 
+/// One label (`LVA<XYZ><form>`, v4.1) found in a period received in indexed
+/// mode. A label is accepted even when its form is absent from the local DTI
+/// and whatever its subtype.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedLabel {
+    pub slot: SlotRef,
+    pub form: String,
+    /// `Known` (`AAA` or registered in the session) or `Dynamic` (first seen).
+    pub subtype: LabelSubtype,
+    /// The form is also a glyph of the local DTI (homonymy to report to the user).
+    pub homonym: bool,
+}
+
+/// Informative note: a label subtype not known by the receiving session
+/// (registered by [`receive_indexed_input`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewLabelSubtype {
+    /// First slot where the subtype appears in the period.
+    pub slot: SlotRef,
+    pub code: [u8; 3],
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct IndexedReport {
     pub entries: Vec<IndexedEntry>,
+    pub labels: Vec<IndexedLabel>,
+    /// Subtypes seen for the first time (informative notes, never errors).
+    pub new_subtypes: Vec<NewLabelSubtype>,
 }
 
 /// Problems of a period received in indexed mode.
@@ -56,6 +83,12 @@ pub enum IndexedInputError {
         slot: SlotRef,
         key: DtiKey,
     },
+    /// A token starting with `LVA` that is truncated or corrupted (shorter than
+    /// 7 characters, or subtype not `[A-Z]{3}`).
+    MalformedLabel {
+        slot: SlotRef,
+        token: String,
+    },
     /// A morphology permission is missing: `+UNION` on a concept joined by `§`,
     /// `+AGGL_NUM` on a digit (B9).
     MorphViolation {
@@ -75,6 +108,7 @@ impl fmt::Display for IndexedInputError {
             Self::InvalidNumeral { atom, .. } => write!(f, "invalid numeral '{atom}'"),
             Self::UnknownKey { key, .. } => write!(f, "unknown key {key}"),
             Self::RejectedKey { key, .. } => write!(f, "key {key} rejected by the local policy"),
+            Self::MalformedLabel { token, .. } => write!(f, "malformed label token '{token}'"),
             Self::MorphViolation {
                 form, key, flag, ..
             } => write!(f, "'{form}' requires {flag} on concept {key}"),
@@ -91,14 +125,15 @@ fn path_atoms(path: &GlyphPath) -> Vec<Symbol> {
         .collect()
 }
 
-/// Glyph atoms of an operand and whether they form a `§` union (glyph paths;
-/// anaphora atoms only refer to an existing path and form no new union).
+/// Glyph atoms of an operand and whether they form a `§` union.
 struct OperandAtoms {
     atoms: Vec<Symbol>,
     union: bool,
-    /// Bound session symbol (`def` name, R13 variable reference, portability-id
-    /// atom): any valid key is accepted, the static DTI is not required.
+    /// Bound session symbol (`def` name, R13 variable reference, portability
+    /// id): any valid key is accepted, the static DTI is not required.
     bound: bool,
+    /// Whole token, checked first as a label (`LVA…`, v4.1).
+    token: Option<Symbol>,
 }
 
 fn path_operand(path: &GlyphPath) -> OperandAtoms {
@@ -106,6 +141,7 @@ fn path_operand(path: &GlyphPath) -> OperandAtoms {
         atoms: path_atoms(path),
         union: !path.is_atomic(),
         bound: false,
+        token: Some(path.text),
     }
 }
 
@@ -114,33 +150,19 @@ fn bound_operand(atoms: Vec<Symbol>) -> OperandAtoms {
         atoms,
         union: false,
         bound: true,
+        token: None,
     }
 }
 
-/// Glyph atoms carried by a slot (markers `~`/`~~` and raw labels carry none).
+/// Glyph atoms carried by a slot (the markers `~`/`~~` carry none).
 fn slot_atoms(slot: &GlyphSlot) -> OperandAtoms {
     match slot {
-        GlyphSlot::Glyph(path) | GlyphSlot::SemaAnaphora(SemaAnaphora::ByGlyph { glyph: path }) => {
-            path_operand(path)
-        }
-        GlyphSlot::GlyphAnaphora(GlyphAnaphora::Prefix { base }) => OperandAtoms {
-            atoms: vec![*base],
-            union: false,
-            bound: false,
-        },
-        GlyphSlot::GlyphAnaphora(GlyphAnaphora::Inverse { base, qualifiers }) => OperandAtoms {
-            atoms: core::iter::once(*base)
-                .chain(qualifiers.iter().copied())
-                .collect(),
-            union: false,
-            bound: false,
-        },
-        GlyphSlot::RawString(_)
-        | GlyphSlot::GlyphAnaphora(GlyphAnaphora::Exact)
-        | GlyphSlot::SemaAnaphora(SemaAnaphora::Latest) => OperandAtoms {
+        GlyphSlot::Glyph(path) => path_operand(path),
+        GlyphSlot::GlyphAnaphora(_) | GlyphSlot::SemaAnaphora(_) => OperandAtoms {
             atoms: Vec::new(),
             union: false,
             bound: false,
+            token: None,
         },
     }
 }
@@ -156,9 +178,7 @@ fn clause_atoms(
         ClauseRef::Relational(block) => (0..u32::try_from(block.pair_count()).unwrap_or(0))
             .filter_map(|p| {
                 block.glyph(p).map(|g| match &g.node {
-                    GlyphSlot::Glyph(path) if path.is_atomic() && is_variable(p) => {
-                        (p, bound_operand(vec![path.root]))
-                    }
+                    GlyphSlot::Glyph(path) if is_variable(p) => (p, bound_operand(vec![path.text])),
                     other => (p, slot_atoms(other)),
                 })
             })
@@ -181,18 +201,22 @@ fn clause_atoms(
             PortabilityBlock::Anchor { id, .. }
             | PortabilityBlock::AnchorRel { id, .. }
             | PortabilityBlock::Rel { id, .. }
-            | PortabilityBlock::RelOff { id, .. } => vec![(0, bound_operand(path_atoms(&id.node)))],
+            | PortabilityBlock::RelOff { id, .. } => vec![(0, bound_operand(vec![id.node.text]))],
             PortabilityBlock::End { .. } => Vec::new(),
         },
     }
 }
 
-/// Validates a period received in indexed mode. Every glyph atom (slot glyphs,
-/// `def` values, anaphora bases) must be a DTI key, resolved with the local
-/// policy (D3), or — when it starts with a digit — a valid numeral (B4). Bound
-/// session symbols — `def` names, R13 variable references and portability-id
-/// atoms — are local to the session: any valid key is accepted (ephemeral keys
-/// included) without requiring the static DTI.
+/// Validates a period received in indexed mode. A slot token starting with
+/// `LVA` is always a label (v4.1): accepted even when absent from the local
+/// DTI and whatever its subtype (a subtype other than `AAA` was generated by
+/// the sending machine), reported in [`IndexedReport::labels`] with its
+/// subtype and its homonymy with a local glyph; only a truncated or corrupted
+/// token is an error ([`IndexedInputError::MalformedLabel`]). Every other glyph atom (slot glyphs, `def` values) must be a DTI key,
+/// resolved with the local policy (D3), or — when it starts with a digit — a
+/// valid numeral (B4). Bound session symbols — `def` names, R13 variable
+/// references and portability ids — are local to the session: any valid key is
+/// accepted (ephemeral keys included) without requiring the static DTI.
 pub fn validate_indexed_input(
     session: &Session,
     id: PeriodId,
@@ -226,6 +250,35 @@ pub fn validate_indexed_input(
                 clause,
                 slot: SlotIndex::new(position),
             };
+            let token = operand.token.and_then(|symbol| interner.resolve(symbol));
+            if let Some(label) = token.and_then(parse_label_wire) {
+                match label {
+                    Ok(label) => {
+                        let subtype = if session.is_known_label_subtype(label.code) {
+                            LabelSubtype::Known(label.code)
+                        } else {
+                            if !report.new_subtypes.iter().any(|n| n.code == label.code) {
+                                report.new_subtypes.push(NewLabelSubtype {
+                                    slot: slot_ref,
+                                    code: label.code,
+                                });
+                            }
+                            LabelSubtype::Dynamic(label.code)
+                        };
+                        report.labels.push(IndexedLabel {
+                            slot: slot_ref,
+                            form: label.form.to_owned(),
+                            subtype,
+                            homonym: is_glyph_form(dti, label.form),
+                        });
+                    }
+                    Err(_) => errors.push(IndexedInputError::MalformedLabel {
+                        slot: slot_ref,
+                        token: token.unwrap_or_default().to_owned(),
+                    }),
+                }
+                continue;
+            }
             let mut resolved: Vec<(DtiKey, &str)> = Vec::new();
             for symbol in operand.atoms {
                 let Some(atom) = interner.resolve(symbol) else {
@@ -315,6 +368,26 @@ pub fn validate_indexed_input(
     } else {
         Err(errors)
     }
+}
+
+/// Receives a period in indexed mode: [`validate_indexed_input`], then
+/// registers every new label subtype in the session (informative notes in
+/// [`IndexedReport::new_subtypes`], the communication is never interrupted) and
+/// marks the label slots as [`SlotKind::Label`]. On error the session is left
+/// unchanged.
+pub fn receive_indexed_input(
+    session: &mut Session,
+    id: PeriodId,
+    dti: &Dti,
+) -> Result<IndexedReport, Vec<IndexedInputError>> {
+    let report = validate_indexed_input(session, id, dti)?;
+    for note in &report.new_subtypes {
+        session.register_label_subtype(note.code);
+    }
+    for label in &report.labels {
+        session.set_slot_kind(label.slot, SlotKind::Label);
+    }
+    Ok(report)
 }
 
 // ═══════════════════════════ Views (C.3) ═══════════════════════════

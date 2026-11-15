@@ -1,7 +1,8 @@
 # Documentation license
 
 The ApriWave grammar specification and the documentation in this directory
-(including `Manuale_Tecnico_ApriWave_v4.0.md`) are
+(including `Manuale_Tecnico_ApriWave_v4.1.md` and its English translation
+`Technical_Manual_ApriWave_v4.1_EN.md`) are
 
 Copyright (c) 2026 irandamarym
 

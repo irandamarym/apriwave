@@ -1,14 +1,14 @@
 //! Stage 2: contextual analysis.
 //!
 //! - DSP tree (Q14–Q16), anchors and relative mode (Q6, R1–R3).
-//! - Inheritance of determiners (Q17, R5) and D8 checks (inherited ref, Q20, Q22).
-//! - Glyph and sema anaphora (Q9, Q10, Q18, R6–R10), with identical rules for
-//!   every `[Tile] [Glyph]` pair: no pair has privileged status.
+//! - Full inheritance of the omitted determiners (v4.1) and Q22.
+//! - Glyph and sema anaphora (`~`, `~~`), with identical rules for every
+//!   `[Tile] [Glyph]` pair: no pair has privileged status.
 //! - Lifecycle of `def` variables (Q11, R11, R13, R14).
-//! - Coordination (Q15, R4a, R4b) and 3-level Garbage Collector.
+//! - Siblings in written order (§9.2) and 3-level Garbage Collector.
 //!
-//! All references are arena indices (`PeriodId`, `ClauseId`, `BindingId`,
-//! `CoordId`): no `Rc`, no `RefCell`, no copy of the antecedent sema.
+//! All references are arena indices (`PeriodId`, `ClauseId`, `BindingId`): no
+//! `Rc`, no `RefCell`, no copy of the antecedent sema.
 //! The analysis works on a **draft** state (variable overlay, antecedent queue,
 //! new bindings) which the session applies only if there are no diagnostics.
 
@@ -20,9 +20,9 @@ use core::num::{NonZeroU32, NonZeroU8};
 use crate::parser::ParserConfig;
 
 use crate::ast::{
-    Case, CaseTile, ClauseBlock, ClauseRef, ColonRun, Comparative, Conjunction, DefOperation,
+    CaseTile, ClauseBlock, ClauseRef, ColonRun, Comparative, Conjunction, DefOperation,
     DefinitionBlock, ExplicitNumber, GlyphAnaphora, GlyphPath, GlyphSlot, Link, LinkedClause,
-    NonEmpty, Period, PeriodClose, PortabilityBlock, PrimarySignal, Quantifier, QuantumNumber,
+    Period, PeriodClose, PortabilityBlock, PrimarySignal, Quantifier, QuantumNumber,
     RelationalBlock, RelationalSignal, SemaAnaphora, Temporal, TemporalMode,
 };
 use crate::error::{Diagnostic, DiagnosticKind, Limit};
@@ -66,7 +66,7 @@ impl ClauseId {
 }
 
 /// Block identified at session level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GlobalClause {
     pub period: PeriodId,
     pub clause: ClauseId,
@@ -94,7 +94,7 @@ impl SlotIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SlotRef {
     pub clause: GlobalClause,
     pub slot: SlotIndex,
@@ -105,24 +105,6 @@ pub struct SlotRef {
 pub struct BindingId(u32);
 
 impl BindingId {
-    pub const fn index(self) -> u32 {
-        self.0
-    }
-
-    const fn slot(self) -> usize {
-        self.0 as usize
-    }
-}
-
-/// Node of a period's coordination arena.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CoordId(u32);
-
-impl CoordId {
-    pub const fn new(index: u32) -> Self {
-        Self(index)
-    }
-
     pub const fn index(self) -> u32 {
         self.0
     }
@@ -166,8 +148,6 @@ pub(crate) fn slot_in_period(
 pub enum SlotValue {
     /// Literal glyph present in the given slot.
     Glyph(SlotRef),
-    /// Raw string present in the given slot.
-    Raw(SlotRef),
     /// `def` variable (version in effect at resolution time).
     Variable(BindingId),
     /// Complete sema of the given block.
@@ -176,17 +156,17 @@ pub enum SlotValue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Resolution {
-    /// Literal glyph or raw string.
+    /// Literal glyph.
     Literal,
-    /// R13: atomic glyph equal to the name of a live variable.
+    /// R13: glyph token equal to the name of a live variable.
     Variable { binding: BindingId },
-    /// `~`, `base~`, `base§mod~`: `antecedent` is the attached slot, `value` the final
-    /// value after following any chain (R9.1).
+    /// `~`: `antecedent` is the attached slot, `value` the final value after
+    /// following any chain (R9.1).
     GlyphAnaphora {
         antecedent: SlotRef,
         value: SlotValue,
     },
-    /// `~~`, `glyph~~`.
+    /// `~~`.
     SemaAnaphora { clause: GlobalClause },
 }
 
@@ -206,10 +186,11 @@ impl SlotAnalysis {
         self.value
     }
 
-    /// Effective quantum number of the pair (rule 1B): the one written in the tile
-    /// (signal or case tile). When omitted it is Dual for the signal pair, and for a
-    /// case pair the number inherited from the antecedent (`~`, Q18) or the
-    /// variable's own number (`def`, R9.4), Dual otherwise.
+    /// Effective quantum number of the pair (rule 1B, v4.1): the one written in
+    /// the tile (signal or case tile). When omitted, the signal pair takes the
+    /// number of the parent's signal (full inheritance), Dual at the root; a case
+    /// pair takes the number of the antecedent (`~`, Q18) or the variable's own
+    /// number (`def`, R9.4), Dual otherwise.
     pub const fn number(&self) -> QuantumNumber {
         self.number
     }
@@ -237,18 +218,24 @@ pub enum DspRole {
     Portability,
 }
 
-/// Effective determiners after inheritance (Q17, R5).
+/// Effective determiners after inheritance (v4.1, full inheritance): a
+/// subordinate clause with a primary or secondary signal inherits from its parent
+/// every determiner it omits — quantifier, `ref`, comparative, tense or
+/// conditional, number — unless it writes its own. `deep` inherits nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EffectiveSignal {
     pub quantifier: Option<Quantifier>,
     pub quantifier_inherited: bool,
     pub reflexive: bool,
     pub reflexive_inherited: bool,
-    /// Never inherited (Q17.3).
     pub comparative: Option<Comparative>,
+    pub comparative_inherited: bool,
     /// `None` = no tense written or inherited (Present by default, M§2.4).
     pub tense: Option<TemporalMode>,
     pub tense_inherited: bool,
+    /// Number of the signal pair (`None` = Dual).
+    pub number: Option<ExplicitNumber>,
+    pub number_inherited: bool,
 }
 
 impl EffectiveSignal {
@@ -277,20 +264,31 @@ impl EffectiveSignal {
                 (false, true) => (true, true),
                 (false, false) => (false, false),
             };
-        let (tense, tense_inherited) = match (own.tense, parent.and_then(|p| p.tense)) {
-            (Some(t), _) => (Some(t), false),
-            (None, Some(t)) => (Some(t), true),
-            (None, None) => (None, false),
-        };
+        let (tense, tense_inherited) = inherit(own.tense, parent.and_then(|p| p.tense));
+        let (comparative, comparative_inherited) =
+            inherit(own.comparative, parent.and_then(|p| p.comparative));
+        let (number, number_inherited) = inherit(own.number, parent.and_then(|p| p.number));
         Self {
             quantifier,
             quantifier_inherited,
             reflexive,
             reflexive_inherited,
-            comparative: own.comparative,
+            comparative,
+            comparative_inherited,
             tense,
             tense_inherited,
+            number,
+            number_inherited,
         }
+    }
+}
+
+/// Written value if present, otherwise the inherited one (with the flag).
+fn inherit<T>(own: Option<T>, parent: Option<T>) -> (Option<T>, bool) {
+    match (own, parent) {
+        (Some(value), _) => (Some(value), false),
+        (None, Some(value)) => (Some(value), true),
+        (None, None) => (None, false),
     }
 }
 
@@ -302,7 +300,6 @@ pub struct ClauseAnalysis {
     parent: Option<ClauseId>,
     children: Vec<ClauseId>,
     conjunction: Option<Conjunction>,
-    groups: Vec<CoordId>,
     signal: Option<EffectiveSignal>,
     canonical_order: Box<[u32]>,
     slots: Box<[Option<SlotAnalysis>]>,
@@ -327,14 +324,10 @@ impl ClauseAnalysis {
         &self.children
     }
 
-    /// Conjunction of the incoming connector, if present.
+    /// Conjunction of the incoming connector, if present (§9.2: the siblings keep
+    /// the written order; the grammar presumes no boolean grouping).
     pub const fn conjunction(&self) -> Option<Conjunction> {
         self.conjunction
-    }
-
-    /// Coordination branches of the children (R4b: siblings without a conjunction = distinct branches).
-    pub fn groups(&self) -> &[CoordId] {
-        &self.groups
     }
 
     pub const fn signal(&self) -> Option<&EffectiveSignal> {
@@ -371,7 +364,6 @@ impl ClauseAnalysis {
             parent: None,
             children: Vec::new(),
             conjunction,
-            groups: Vec::new(),
             signal: None,
             canonical_order: Box::new([]),
             slots: slots.into_boxed_slice(),
@@ -379,23 +371,11 @@ impl ClauseAnalysis {
     }
 }
 
-/// Node of the coordination tree (Q15: left associativity, chains with the
-/// same conjunction flattened).
-#[derive(Debug, PartialEq, Eq)]
-pub enum CoordNode {
-    Clause(ClauseId),
-    Group {
-        conj: Conjunction,
-        members: Vec<CoordId>,
-    },
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub struct AnalyzedPeriod {
     clauses: Box<[ClauseAnalysis]>,
     roots: Box<[ClauseId]>,
-    root_groups: Box<[CoordId]>,
-    coordination: Box<[CoordNode]>,
+    warnings: Box<[Diagnostic]>,
 }
 
 impl AnalyzedPeriod {
@@ -412,13 +392,14 @@ impl AnalyzedPeriod {
         &self.roots
     }
 
-    /// Coordination branches of level 0.
-    pub fn root_groups(&self) -> &[CoordId] {
-        &self.root_groups
+    /// Diagnostics of this period downgraded to warnings by the configuration
+    /// (§15): the period was accepted despite them.
+    pub fn warnings(&self) -> &[Diagnostic] {
+        &self.warnings
     }
 
-    pub fn coord(&self, id: CoordId) -> Option<&CoordNode> {
-        self.coordination.get(id.slot())
+    pub(crate) fn set_warnings(&mut self, warnings: Vec<Diagnostic>) {
+        self.warnings = warnings.into_boxed_slice();
     }
 }
 
@@ -459,7 +440,6 @@ impl Binding {
 
 /// Already committed session state (read-only during analysis).
 pub(crate) struct Committed<'a> {
-    pub periods: &'a [Period],
     pub analyses: &'a [AnalyzedPeriod],
     pub bindings: &'a [Binding],
     pub variables: &'a BTreeMap<Symbol, BindingId>,
@@ -475,6 +455,8 @@ pub(crate) struct Outcome {
     pub variables_cleared: bool,
     pub carried_tail: Vec<GlobalClause>,
     pub keep_base_carried: bool,
+    /// Diagnostics downgraded to warnings by the configuration (§15).
+    pub warnings: Vec<Diagnostic>,
 }
 
 pub(crate) fn analyze<'a>(
@@ -485,7 +467,6 @@ pub(crate) fn analyze<'a>(
 ) -> Result<Outcome, Vec<Diagnostic>> {
     let mut analyzer = Analyzer {
         committed,
-        new_periods,
         first,
         max_depth: config.max_dsp_depth,
         max_loop_iterations: config.max_loop_iterations,
@@ -515,10 +496,18 @@ pub(crate) fn analyze<'a>(
         analyzer.analyses.push(analysis);
     }
 
-    if !analyzer.diagnostics.is_empty() {
-        return Err(analyzer.diagnostics);
+    // §15: the input is rejected only by blocking diagnostics; the others are
+    // kept as warnings.
+    let graded: Vec<Diagnostic> = analyzer
+        .diagnostics
+        .iter()
+        .map(|d| d.graded(config.warnings))
+        .collect();
+    if graded.iter().any(|d| !d.is_warning()) {
+        return Err(graded);
     }
     Ok(Outcome {
+        warnings: graded,
         analyses: analyzer.analyses,
         bindings: analyzer.bindings,
         overlay: analyzer.overlay,
@@ -599,7 +588,6 @@ struct PeriodState<'a> {
 
 struct Analyzer<'a> {
     committed: Committed<'a>,
-    new_periods: &'a [Period],
     first: PeriodId,
     max_depth: NonZeroU8,
     max_loop_iterations: NonZeroU32,
@@ -618,21 +606,6 @@ impl<'a> Analyzer<'a> {
     }
 
     // ───────────────────────── Arena access ─────────────────────────
-
-    fn period_ast(&self, id: PeriodId) -> Option<&'a Period> {
-        match id.0.checked_sub(self.first.0) {
-            Some(offset) => self.new_periods.get(offset as usize),
-            None => self.committed.periods.get(id.slot()),
-        }
-    }
-
-    fn slot_ast(&self, slot: SlotRef) -> Option<&'a GlyphSlot> {
-        slot_in_period(
-            self.period_ast(slot.clause.period)?,
-            slot.clause.clause,
-            slot.slot,
-        )
-    }
 
     fn analysis_of<'s>(
         &'s self,
@@ -664,33 +637,6 @@ impl<'a> Analyzer<'a> {
             return None;
         }
         self.committed.variables.get(&name).copied()
-    }
-
-    /// Glyph paths of a value (R9.3: raw strings have no path).
-    fn value_paths(&self, value: SlotValue) -> Vec<&'a GlyphPath> {
-        match value {
-            SlotValue::Glyph(slot) => match self.slot_ast(slot) {
-                Some(GlyphSlot::Glyph(path)) => vec![path],
-                _ => Vec::new(),
-            },
-            SlotValue::Variable(binding) => self
-                .binding(binding)
-                .map(|b| {
-                    b.values
-                        .iter()
-                        .rev()
-                        .filter_map(|v| match v {
-                            SlotValue::Glyph(slot) => match self.slot_ast(*slot) {
-                                Some(GlyphSlot::Glyph(path)) => Some(path),
-                                _ => None,
-                            },
-                            SlotValue::Raw(_) | SlotValue::Variable(_) | SlotValue::Sema(_) => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-            SlotValue::Raw(_) | SlotValue::Sema(_) => Vec::new(),
-        }
     }
 
     // ───────────────────────── Antecedents (R6) ─────────────────────────
@@ -769,68 +715,19 @@ impl<'a> Analyzer<'a> {
             .collect()
     }
 
-    fn search_glyph(
-        &self,
-        st: &PeriodState<'a>,
-        depth: usize,
-        anaphora: &GlyphAnaphora,
-    ) -> Option<Candidate> {
-        for clause in self.antecedents(st, depth) {
-            let candidates = self.candidates(st, clause);
-            let found = match anaphora {
-                // R9.2: slots with a sema anaphora are skipped.
-                GlyphAnaphora::Exact => candidates
-                    .into_iter()
-                    .find(|c| !matches!(c.value, SlotValue::Sema(_))),
-                // R7.1
-                GlyphAnaphora::Prefix { base } => candidates.into_iter().find(|c| {
-                    self.value_paths(c.value)
-                        .iter()
-                        .any(|p| p.root == *base && !p.qualifiers.is_empty())
-                }),
-                // R7.2: proper prefix, the longest in the block.
-                GlyphAnaphora::Inverse { base, qualifiers } => {
-                    let mut best: Option<(usize, Candidate)> = None;
-                    for candidate in candidates {
-                        for path in self.value_paths(candidate.value) {
-                            if is_proper_prefix(path, *base, qualifiers) {
-                                let length = path.qualifiers.len();
-                                if best.as_ref().is_none_or(|(l, _)| length > *l) {
-                                    best = Some((length, candidate));
-                                }
-                            }
-                        }
-                    }
-                    best.map(|(_, c)| c)
-                }
-            };
-            if found.is_some() {
-                return found;
-            }
-        }
-        None
+    /// `~`: the last pair, in canonical order, of the nearest antecedent block
+    /// that holds a value other than a sema (R9.2: sema anaphora are skipped).
+    fn search_glyph(&self, st: &PeriodState<'a>, depth: usize) -> Option<Candidate> {
+        self.antecedents(st, depth).find_map(|clause| {
+            self.candidates(st, clause)
+                .into_iter()
+                .find(|c| !matches!(c.value, SlotValue::Sema(_)))
+        })
     }
 
-    fn search_sema(
-        &self,
-        st: &PeriodState<'a>,
-        depth: usize,
-        anaphora: &SemaAnaphora,
-    ) -> Option<GlobalClause> {
-        let mut antecedents = self.antecedents(st, depth);
-        match anaphora {
-            SemaAnaphora::Latest => antecedents.next(),
-            // The glyph may appear in any pair of the antecedent block.
-            SemaAnaphora::ByGlyph { glyph } => antecedents.find(|clause| {
-                self.analysis_of(st, *clause).is_some_and(|analysis| {
-                    analysis
-                        .slots
-                        .iter()
-                        .flatten()
-                        .any(|slot| self.value_paths(slot.value).contains(&glyph))
-                })
-            }),
-        }
+    /// `~~`: the first antecedent block of the search order.
+    fn search_sema(&self, st: &PeriodState<'a>, depth: usize) -> Option<GlobalClause> {
+        self.antecedents(st, depth).next()
     }
 
     fn resolve(
@@ -843,8 +740,9 @@ impl<'a> Analyzer<'a> {
         let default_number = written.unwrap_or(QuantumNumber::Dual);
         match glyph {
             GlyphSlot::Glyph(path) => {
-                if query.variables && path.is_atomic() {
-                    if let Some(binding) = self.live(path.root) {
+                // R13: the whole token is compared with the variable names.
+                if query.variables {
+                    if let Some(binding) = self.live(path.text) {
                         // R9.4 + rule 1B: in a case pair an omitted number is the
                         // variable's own; in the signal pair it stays Dual.
                         let inherited = self
@@ -864,17 +762,12 @@ impl<'a> Analyzer<'a> {
                     number: default_number,
                 })
             }
-            GlyphSlot::RawString(_) => Ok(SlotAnalysis {
-                resolution: Resolution::Literal,
-                value: SlotValue::Raw(query.slot),
-                number: default_number,
-            }),
-            GlyphSlot::GlyphAnaphora(anaphora) => {
+            GlyphSlot::GlyphAnaphora(GlyphAnaphora::Exact) => {
                 let found = self
-                    .search_glyph(st, query.depth, anaphora)
+                    .search_glyph(st, query.depth)
                     .ok_or(DiagnosticKind::UnresolvedGlyphAnaphora)?;
                 // Q18: the number written in the tile takes precedence, otherwise it is
-                // inherited (rule 1B: never in the signal pair, which stays Dual).
+                // inherited (the signal pair takes its number from the signal tile).
                 let number = written.unwrap_or(if query.inherit_number {
                     found.number
                 } else {
@@ -889,9 +782,9 @@ impl<'a> Analyzer<'a> {
                     number,
                 })
             }
-            GlyphSlot::SemaAnaphora(anaphora) => {
+            GlyphSlot::SemaAnaphora(SemaAnaphora::Latest) => {
                 let clause = self
-                    .search_sema(st, query.depth, anaphora)
+                    .search_sema(st, query.depth)
                     .ok_or(DiagnosticKind::UnresolvedSemaAnaphora)?;
                 Ok(SlotAnalysis {
                     resolution: Resolution::SemaAnaphora { clause },
@@ -1103,22 +996,9 @@ impl<'a> Analyzer<'a> {
             .and_then(|a| a.signal);
         let effective = EffectiveSignal::compute(signal, parent_signal);
 
-        // D8 / Q22
+        // Q22
         if depth == 0 && matches!(signal, RelationalSignal::Secondary { .. }) {
             self.report(DiagnosticKind::SecondarySignalAtRoot, signal_span);
-        }
-        // D8 / Q17.2: an inherited `ref` forbids the Accusative (a written `ref` is
-        // already checked by stage 1).
-        if effective.reflexive_inherited {
-            for pair in &block.cases {
-                if pair.tile.node.case == Case::Accusative {
-                    self.report(DiagnosticKind::AccusativeInReflexive, pair.tile.span);
-                }
-            }
-        }
-        // D8 / Q20
-        if effective.quantifier.is_some() && block.cases.is_empty() && !effective.reflexive {
-            self.report(DiagnosticKind::QuantifierMisuse, signal_span);
         }
 
         let canonical_order = self.canonical_order(block, signal_span);
@@ -1127,9 +1007,10 @@ impl<'a> Analyzer<'a> {
             clause,
         };
         let depth_index = usize::from(depth);
-        // Same resolution for every pair. Rule 1B: the signal pair takes the number
-        // written in the signal tile, never an inherited one.
-        let signal_number = signal.determiners().number;
+        // Same resolution for every pair. Rule 1B (v4.1): the signal pair takes the
+        // number of the signal tile, written or inherited from the parent's signal;
+        // never the number of an anaphora antecedent.
+        let signal_number = effective.number;
         let pairs = core::iter::once((&block.signal.glyph, signal_number, None)).chain(
             block
                 .cases
@@ -1148,7 +1029,7 @@ impl<'a> Analyzer<'a> {
                 break;
             };
             if let Some(tile) = case_tile.filter(|tile| tile.node.case.is_loop()) {
-                self.check_loop_tile(tile, depth, signal);
+                self.check_loop_tile(tile, depth, &effective);
                 // B2: `~` after `abdur` is a structural marker (like `abse ~`), not an anaphora.
                 if matches!(glyph.node, GlyphSlot::GlyphAnaphora(GlyphAnaphora::Exact)) {
                     slots.push(None);
@@ -1178,7 +1059,6 @@ impl<'a> Analyzer<'a> {
             parent,
             children: Vec::new(),
             conjunction: link.conjunction(),
-            groups: Vec::new(),
             signal: Some(effective),
             canonical_order,
             slots: slots.into_boxed_slice(),
@@ -1195,9 +1075,14 @@ impl<'a> Analyzer<'a> {
     }
 
     /// B2: `abdur=<N>` must not exceed `max_loop_iterations` (L5); the bare loop
-    /// marker `abdur` is allowed only in a subordinate clause whose signal tile
-    /// carries a written conditional determiner (L2).
-    fn check_loop_tile(&mut self, tile: &Spanned<CaseTile>, depth: u8, signal: &RelationalSignal) {
+    /// marker `abdur` is allowed only in a subordinate clause whose effective
+    /// signal carries a conditional, written or inherited from the parent (v4.1).
+    fn check_loop_tile(
+        &mut self,
+        tile: &Spanned<CaseTile>,
+        depth: u8,
+        effective: &EffectiveSignal,
+    ) {
         match tile.node.case.loop_count() {
             Some(count) => {
                 if count.get() > self.max_loop_iterations.get() {
@@ -1210,10 +1095,7 @@ impl<'a> Analyzer<'a> {
                 }
             }
             None => {
-                let conditional = matches!(
-                    signal.determiners().tense,
-                    Some(TemporalMode::Conditional(_))
-                );
+                let conditional = matches!(effective.tense, Some(TemporalMode::Conditional(_)));
                 if depth == 0 || !conditional {
                     self.report(DiagnosticKind::LoopMarkerOutsideConditional, tile.span);
                 }
@@ -1221,7 +1103,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    /// M§3.1 / Q21: signal pair (position 0), then the case pairs
+    /// M§3.1: signal pair (position 0), then the case pairs
     /// stably reordered by case rank.
     fn canonical_order(&mut self, block: &RelationalBlock, span: Span) -> Box<[u32]> {
         let mut cases: Vec<(u8, u32)> = Vec::with_capacity(block.cases.len());
@@ -1475,110 +1357,16 @@ impl<'a> Analyzer<'a> {
         st.rel_mode = relative;
     }
 
-    // ───────────────────────── Coordination (Q15, R4) ─────────────────────────
+    // ───────────────────────── Period end ─────────────────────────
 
-    fn finish_period(&mut self, st: PeriodState<'a>, span: Span) -> AnalyzedPeriod {
-        let PeriodState {
-            mut clauses, roots, ..
-        } = st;
-        let mut arena: Vec<CoordNode> = Vec::new();
-
-        let root_groups = self.build_groups(&roots, &clauses, &mut arena, span);
-        let mut child_groups: Vec<Vec<CoordId>> = Vec::with_capacity(clauses.len());
-        for analysis in &clauses {
-            child_groups.push(self.build_groups(&analysis.children, &clauses, &mut arena, span));
-        }
-        for (analysis, groups) in clauses.iter_mut().zip(child_groups) {
-            analysis.groups = groups;
-        }
-
+    /// §9.2 (v4.1): siblings keep the written order, each with its own
+    /// conjunction; no coordination tree or boolean grouping is presumed.
+    fn finish_period(&mut self, st: PeriodState<'a>, _span: Span) -> AnalyzedPeriod {
+        let PeriodState { clauses, roots, .. } = st;
         AnalyzedPeriod {
             clauses: clauses.into_boxed_slice(),
             roots: roots.into_boxed_slice(),
-            root_groups: root_groups.into_boxed_slice(),
-            coordination: arena.into_boxed_slice(),
+            warnings: Box::new([]),
         }
     }
-
-    /// Siblings at the same level: a conjunction binds the block to the branch of the
-    /// immediately preceding sibling (R4b); without a sibling it is a leaf (R4a).
-    /// Chains with the same conjunction are flattened; different conjunctions
-    /// associate to the left. Iterative construction: no recursion.
-    fn build_groups(
-        &mut self,
-        siblings: &[ClauseId],
-        clauses: &[ClauseAnalysis],
-        arena: &mut Vec<CoordNode>,
-        span: Span,
-    ) -> Vec<CoordId> {
-        let mut branches: Vec<CoordId> = Vec::new();
-        for sibling in siblings {
-            let conjunction = clauses.get(sibling.slot()).and_then(|c| c.conjunction);
-            let Some(leaf) = self.push_coord(arena, CoordNode::Clause(*sibling), span) else {
-                break;
-            };
-            let current = match (conjunction, branches.last().copied()) {
-                (Some(conj), Some(current)) => Some((conj, current)),
-                _ => None,
-            };
-            let Some((conj, current)) = current else {
-                branches.push(leaf);
-                continue;
-            };
-            if let Some(CoordNode::Group {
-                conj: group_conj,
-                members,
-            }) = arena.get_mut(current.slot())
-            {
-                if *group_conj == conj {
-                    members.push(leaf);
-                    continue;
-                }
-            }
-            let Some(group) = self.push_coord(
-                arena,
-                CoordNode::Group {
-                    conj,
-                    members: vec![current, leaf],
-                },
-                span,
-            ) else {
-                break;
-            };
-            if let Some(last) = branches.last_mut() {
-                *last = group;
-            }
-        }
-        branches
-    }
-
-    fn push_coord(
-        &mut self,
-        arena: &mut Vec<CoordNode>,
-        node: CoordNode,
-        span: Span,
-    ) -> Option<CoordId> {
-        let Some(index) = to_u32(arena.len()) else {
-            self.report(
-                DiagnosticKind::LimitExceeded {
-                    limit: Limit::IndexSpace,
-                },
-                span,
-            );
-            return None;
-        };
-        arena.push(node);
-        Some(CoordId(index))
-    }
-}
-
-/// R7.2: `path` is a proper prefix of `base§qualifiers`.
-fn is_proper_prefix(path: &GlyphPath, base: Symbol, qualifiers: &NonEmpty<Symbol>) -> bool {
-    path.root == base
-        && path.qualifiers.len() < qualifiers.len()
-        && path
-            .qualifiers
-            .iter()
-            .zip(qualifiers.iter())
-            .all(|(a, b)| a == b)
 }

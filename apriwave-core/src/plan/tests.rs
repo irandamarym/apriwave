@@ -173,10 +173,15 @@ fn abdur_validation() -> TestResult {
         DiagnosticKind::UnknownCaseTile,
         ErrorCode::Syntax,
     )?;
+    // v4.1: several loops in one block are allowed (nested in written order).
+    ingest(&mut Session::new(), "/^ ta x abdur=3 ~ abdur=5 ~ ^/")?;
+    // v4.1: the bare marker accepts an inherited conditional (I13).
+    ingest(&mut Session::new(), "/^ tazato x nu y : ta c abdur ~ ^/")?;
+    // An explicit indicative override removes the conditional.
     expect(
-        "/^ ta x abdur=3 ~ abdur=5 ~ ^/",
-        DiagnosticKind::DuplicateCase,
-        ErrorCode::CaseAmbiguity,
+        "/^ tazato x nu y : taato c abdur ~ ^/",
+        DiagnosticKind::LoopMarkerOutsideConditional,
+        ErrorCode::Scope,
     )?;
     expect(
         "/^ defu v abdur=3 x ^/",
@@ -233,6 +238,33 @@ fn loops_repeat_clause_and_subtree() -> TestResult {
         "control",
         shape(&plan),
         vec![(1, vec![]), (0, vec![0]), (0, vec![1])],
+    )?;
+    // v4.1: a control subordinate with an inherited conditional.
+    let plan = plan_of("/^ tazato x abdur=2 ~ : ta c abdur ~ ^/", &dti)?;
+    check(
+        "inherited control",
+        shape(&plan),
+        vec![(1, vec![]), (0, vec![0]), (0, vec![1])],
+    )?;
+    // v4.1: two loops in one clause nest in written order (N1 × N2).
+    let plan = plan_of("/^ ta x abdur=2 ~ abdur=3 ~ : ta y ^/", &dti)?;
+    check(
+        "nested loops of one clause",
+        shape(&plan),
+        vec![
+            (0, vec![0, 0]),
+            (1, vec![0, 0]),
+            (0, vec![0, 1]),
+            (1, vec![0, 1]),
+            (0, vec![0, 2]),
+            (1, vec![0, 2]),
+            (0, vec![1, 0]),
+            (1, vec![1, 0]),
+            (0, vec![1, 1]),
+            (1, vec![1, 1]),
+            (0, vec![1, 2]),
+            (1, vec![1, 2]),
+        ],
     )?;
     // No loops: plain pre-order, def and portability blocks excluded.
     let plan = plan_of("/^ defu v a x y ta a : ta b : anchor p : end ~ ^/", &dti)?;

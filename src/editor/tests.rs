@@ -4,15 +4,18 @@
 use std::fmt::Debug;
 
 use super::{
-    parse_settings, preprocess_assisted_input, reclassify_as_label, AssistDiagnosticKind,
-    AssistNote, AssistOutput, AssistSettings, Chord, ChordError, ComparativeShortcuts,
-    EditorSettings, Key, KeyPress, LabelError, SettingsErrorKind, ShortcutAction, ShortcutOutcome,
-    ShortcutResolver,
+    apply_label_choices, copy_subordinates, parse_settings, preprocess_assisted_input,
+    preprocess_with_choices, suggestions, ActionShortcuts, AssistDiagnosticKind, AssistNote,
+    AssistOutput, AssistSettings, Autocomplete, Chord, ChordError, ComparativeShortcuts,
+    CopiedBlock, CopyError, CopyMode, EditorSettings, Key, KeyPress, SettingsErrorKind,
+    ShortcutAction, ShortcutContext, ShortcutOutcome, ShortcutResolver, SlotChoice, Suggestion,
+    SuggestionKind,
 };
+use crate::analyze::{ClauseId, GlobalClause, SlotIndex, SlotRef};
 use crate::ast::Comparative;
 use crate::dti::{Dti, DtiKey};
-use crate::error::ErrorCode;
-use crate::session::Session;
+use crate::error::{ErrorCode, WarningCodes};
+use crate::session::{Session, SlotKind};
 use crate::span::Span;
 use crate::stage3::MorphFlag;
 
@@ -75,14 +78,15 @@ fn whitespace_runs_become_single_spaces() -> TestResult {
 }
 
 #[test]
-fn comments_are_removed_outside_raw_strings() -> TestResult {
+fn comments_start_at_a_token_boundary() -> TestResult {
     expect_canon(
         "/^ ta x // comment ^/ not a close\nnu y ^/",
         "/^ ta x nu y ^/",
     )?;
-    // A comment glued to a token ends the token.
-    expect_canon("/^ ta x nu y// trailing\n^/", "/^ ta x nu y ^/")?;
-    // `//` inside a raw string is not a comment.
+    // v4.1: `//` inside a token belongs to it (glyphs may contain any visible
+    // character); a comment starts at the beginning of a token.
+    expect_canon("/^ ta x nu y// kept\n^/ ^/", "/^ ta x nu y// kept ^/ ^/")?;
+    expect_canon("/^ ta http://x nu y // note\n^/", "/^ ta http://x nu y ^/")?;
     expect_canon(
         "/^ ta \"http://x\" nu y // note\n^/",
         "/^ ta \"http://x\" nu y ^/",
@@ -179,8 +183,9 @@ fn brace_errors() -> TestResult {
     expect_errors("/^ ta c { tazato a", &[K::UnclosedBrace])?;
     expect_errors("/^ ta c } ^/", &[K::UnexpectedCloseBrace])?;
     expect_errors("/^ ta c { } ^/", &[K::EmptyBraces])?;
-    expect_errors("/^ ta { tazato a } ^/", &[K::MisplacedBrace])?;
-    expect_errors("/^ ta c { tazato } ^/", &[K::MisplacedBrace])?;
+    // v4.1 Slot Locking: a brace in an even slot is a glyph.
+    expect_errors("/^ ta { tazato a } ^/", &[K::UnexpectedCloseBrace])?;
+    expect_errors("/^ ta c { tazato } ^/", &[K::UnclosedBrace])?;
     expect_errors("/^ ta c { tazato a } { tazato b } ^/", &[K::MisplacedBrace])?;
     expect_errors(
         "/^ ta c { tazato a : tazato b } ^/",
@@ -542,7 +547,7 @@ fn ambiguous_and_disabled_multiword_entries() -> TestResult {
 }
 
 #[test]
-fn unknown_glyphs_produce_label_notes() -> TestResult {
+fn unknown_glyphs_produce_notes() -> TestResult {
     let dti = fixture()?;
     let out = preprocess_assisted_input(
         "/^ ta blu nu verde a 42 dad \"x\" gpa verde~ ^/ /^ defu dev a verde ^/",
@@ -550,14 +555,27 @@ fn unknown_glyphs_produce_label_notes() -> TestResult {
         Some(&dti),
     )
     .map_err(|d| format!("{d:#?}"))?;
+    // v4.1: `"x"` and `verde~` are ordinary glyphs, unknown to the DTI.
     check(
         "notes",
         out.notes,
-        vec![AssistNote::UnknownGlyph {
-            token: "blu".to_owned(),
-            span: crate::span::Span::new(6, 9),
-            label_suggestion: Some("\"blu\"".to_owned()),
-        }],
+        vec![
+            AssistNote::UnknownGlyph {
+                token: "blu".to_owned(),
+                span: Span::new(6, 9),
+                structural: false,
+            },
+            AssistNote::UnknownGlyph {
+                token: "\"x\"".to_owned(),
+                span: Span::new(28, 31),
+                structural: false,
+            },
+            AssistNote::UnknownGlyph {
+                token: "verde~".to_owned(),
+                span: Span::new(36, 42),
+                structural: false,
+            },
+        ],
     )
 }
 
@@ -698,21 +716,31 @@ fn synonyms_are_normalized_in_portability_ids() -> TestResult {
 }
 
 #[test]
-fn synonyms_are_normalized_in_anaphora_atoms() -> TestResult {
+fn suffixed_tokens_are_ordinary_glyphs() -> TestResult {
     let dti = fixture()?;
-    let out = assist("/^ ta home~ nu dimora§verdesmeraldo~ a doggy~~ ^/", &dti)?;
+    // v4.1: `home~` and `doggy~~` are glyph tokens (no anaphora bases): they are
+    // not forms of the DTI and stay unchanged.
+    let out = assist("/^ ta home~ nu dimora a doggy~~ ^/", &dti)?;
     check(
         "text",
         out.text.as_str(),
-        "/^ ta casa~ nu casa§verdesmeraldo~ a dog~~ ^/",
+        "/^ ta home~ nu casa a doggy~~ ^/",
     )?;
     check(
         "notes",
         out.notes,
         vec![
-            normalized("home", "casa", 6, 10),
+            AssistNote::UnknownGlyph {
+                token: "home~".to_owned(),
+                span: Span::new(6, 11),
+                structural: false,
+            },
             normalized("dimora", "casa", 15, 21),
-            normalized("doggy", "dog", 40, 45),
+            AssistNote::UnknownGlyph {
+                token: "doggy~~".to_owned(),
+                span: Span::new(24, 31),
+                structural: false,
+            },
         ],
     )?;
     // The bare marks are never touched.
@@ -750,7 +778,7 @@ fn every_segment_of_a_qualified_path_is_normalized() -> TestResult {
             AssistNote::UnknownGlyph {
                 token: "home§blu".to_owned(),
                 span: Span::new(6, 15),
-                label_suggestion: Some("\"home§blu\"".to_owned()),
+                structural: false,
             },
         ],
     )
@@ -773,7 +801,6 @@ fn ambiguous_synonyms_are_rejected_in_every_position() -> TestResult {
         "/^ ta x nu verde§portal ^/",
         "/^ defu portal au verde ^/",
         "/^ ta x : anchor portal ^/",
-        "/^ ta x nu portal~ ^/",
     ] {
         check(
             input,
@@ -849,13 +876,21 @@ fn free_identifiers_are_unchanged() -> TestResult {
         Some(&AssistNote::UnknownGlyph {
             token: "blu".to_owned(),
             span: Span::new(15, 18),
-            label_suggestion: Some("\"blu\"".to_owned()),
+            structural: false,
         }),
     )?;
-    // Raw labels and numerals are never looked up.
+    // Numerals are known; v4.1: `"home"` is an ordinary (unknown) glyph.
     let out = assist("/^ ta \"home\" nu 42 ^/", &dti)?;
-    check("label", out.text.as_str(), "/^ ta \"home\" nu 42 ^/")?;
-    check("label notes", out.notes, Vec::new())?;
+    check("quoted", out.text.as_str(), "/^ ta \"home\" nu 42 ^/")?;
+    check(
+        "quoted notes",
+        out.notes,
+        vec![AssistNote::UnknownGlyph {
+            token: "\"home\"".to_owned(),
+            span: Span::new(6, 12),
+            structural: false,
+        }],
+    )?;
     // Without a DTI nothing is normalized.
     expect_canon(
         "/^ ta home nu dimora§doggy ^/",
@@ -863,47 +898,158 @@ fn free_identifiers_are_unchanged() -> TestResult {
     )
 }
 
+/// Editor fixture plus local labels: `Roma` (label only), `casa` (also a
+/// glyph) and `dimora` (also a synonym of `casa`).
+fn fixture_with_labels() -> Result<Dti, String> {
+    let (green, house) = (key("green")?, key("house")?);
+    let universal = format!(
+        "#awdti 1\n#role universal\n#version 1\n#lang en\n\
+rec {green} green\n\
+rec {house} house syn:home morph:+UNION\n"
+    );
+    let local = format!(
+        "#awdti 1\n#role local\n#universal 1\n#lang it\n\
+use {green} form:verde\n\
+use {house} form:casa syn:dimora\n\
+label {} Roma\n\
+label {} casa\n\
+label {} dimora\n",
+        key("labelroma")?,
+        key("labelcasa")?,
+        key("labeldimora")?
+    );
+    Dti::load(&universal, &local).map_err(|d| format!("{d:#?}"))
+}
+
 #[test]
-fn reclassify_as_label_rules() -> TestResult {
+fn unmarked_labels_ask_for_the_mandatory_choice_v4_1() -> TestResult {
+    let dti = fixture_with_labels()?;
+    // Without a selection every slot is a glyph: `dimora` (a label, and a
+    // synonym of `casa`) is normalized; the notes ask for the selection.
+    let out = assist("/^ ta Roma nu casa a dimora ^/", &dti)?;
+    check("text", out.text.as_str(), "/^ ta Roma nu casa a casa ^/")?;
+    check("no label spans", out.labels, Vec::new())?;
     check(
-        "plain",
-        reclassify_as_label("Roma"),
-        Ok("\"Roma\"".to_owned()),
-    )?;
+        "notes",
+        out.notes,
+        vec![
+            AssistNote::Label {
+                token: "Roma".to_owned(),
+                span: Span::new(6, 10),
+            },
+            AssistNote::GlyphOrLabel {
+                token: "casa".to_owned(),
+                span: Span::new(14, 18),
+            },
+            normalized("dimora", "casa", 21, 27),
+            AssistNote::GlyphOrLabel {
+                token: "dimora".to_owned(),
+                span: Span::new(21, 27),
+            },
+        ],
+    )
+}
+
+#[test]
+fn selected_labels_are_inert_and_travel_as_labels_v4_1() -> TestResult {
+    let dti = fixture_with_labels()?;
+    let input = "/^ ta  Roma nu casa a dimora ^/";
+    let choices = [
+        SlotChoice {
+            span: Span::new(7, 11),
+            kind: SlotKind::Label,
+        },
+        SlotChoice {
+            span: Span::new(15, 19),
+            kind: SlotKind::Glyph,
+        },
+        SlotChoice {
+            span: Span::new(22, 28),
+            kind: SlotKind::Label,
+        },
+    ];
+    let out = preprocess_with_choices(input, &AssistSettings::default(), Some(&dti), &choices)
+        .map_err(|d| format!("{d:#?}"))?;
+    // A label is an inert string: `dimora` is not normalized.
+    check("text", out.text.as_str(), "/^ ta Roma nu casa a dimora ^/")?;
+    check("notes", out.notes, Vec::new())?;
     check(
-        "url",
-        reclassify_as_label("http://x"),
-        Ok("\"http://x\"".to_owned()),
+        "label spans in the output",
+        out.labels.as_slice(),
+        &[Span::new(6, 10), Span::new(21, 27)][..],
     )?;
-    check("empty", reclassify_as_label(""), Err(LabelError::Empty))?;
+    let mut session = Session::new();
+    let ids = session.ingest(&out.text).map_err(|d| format!("{d:#?}"))?;
     check(
-        "quote",
-        reclassify_as_label("a\"b"),
-        Err(LabelError::ContainsQuote),
+        "marked slots",
+        apply_label_choices(&mut session, &ids, &out.labels),
+        2,
     )?;
+    let id = ids.first().copied().ok_or("no period")?;
     check(
-        "whitespace",
-        reclassify_as_label("a b"),
-        Err(LabelError::ContainsWhitespace),
+        "indexed",
+        crate::stage3::render_indexed_period(&session, id, &dti).map_err(|e| e.to_string())?,
+        format!("/^ ta LVAAAARoma nu {} a LVAAAAdimora ^/", key("house")?),
     )?;
+    // A label choice on a form that is not censused as a label.
+    let out = preprocess_with_choices(
+        "/^ ta Milano ^/",
+        &AssistSettings::default(),
+        Some(&dti),
+        &[SlotChoice {
+            span: Span::new(6, 12),
+            kind: SlotKind::Label,
+        }],
+    )
+    .map_err(|d| format!("{d:#?}"))?;
     check(
-        "control",
-        reclassify_as_label("a\u{1b}b"),
-        Err(LabelError::ForbiddenCharacter { ch: '\u{1b}' }),
+        "uncensused label",
+        out.notes,
+        vec![AssistNote::UncensusedLabel {
+            token: "Milano".to_owned(),
+            span: Span::new(6, 12),
+        }],
+    )
+}
+
+#[test]
+fn delimiters_in_even_slots_are_checked_against_the_dti_v4_1() -> TestResult {
+    let dti = fixture()?;
+    let out = assist("/^ ta verde nu ^/", &dti)?;
+    check("text", out.text.as_str(), "/^ ta verde nu ^/")?;
+    check(
+        "not censused, structural",
+        out.notes,
+        vec![AssistNote::UnknownGlyph {
+            token: "^/".to_owned(),
+            span: Span::new(15, 17),
+            structural: true,
+        }],
     )?;
-    for ch in [
-        '\u{061C}', '\u{200B}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2060}', '\u{2064}',
-        '\u{2066}', '\u{2069}', '\u{FEFF}',
-    ] {
-        check(
-            "bidi",
-            reclassify_as_label(&format!("a{ch}b")),
-            Err(LabelError::ForbiddenCharacter { ch }),
-        )?;
+    // The session reports the missing period close as well.
+    match Session::new().ingest(&out.text) {
+        Err(diagnostics)
+            if diagnostics
+                .iter()
+                .any(|d| d.kind == crate::DiagnosticKind::MissingPeriodClose) =>
+        {
+            Ok(())
+        }
+        other => Err(format!("expected MissingPeriodClose, got {other:?}")),
     }
-    // A reclassified label is accepted by the session.
-    let label = reclassify_as_label("Blu-Notte").map_err(|e| e.to_string())?;
-    expect_ingest(&format!("/^ ta {label} nu io ^/"))
+}
+
+#[test]
+fn even_slots_follow_slot_locking_v4_1() -> TestResult {
+    // Period delimiters, colon runs, braces and quotes in an even slot are glyphs.
+    for text in [
+        "/^ ta ^/ nu : a { ^/",
+        "/^ ta /^/ nu \" a } ^/",
+        "/^ ta x nu ~ a ~~ ^/",
+    ] {
+        expect_canon(text, text)?;
+    }
+    expect_ingest("/^ ta ^/ nu : a { ^/")
 }
 
 // ═══════════════════════════ Settings ═══════════════════════════
@@ -1335,4 +1481,344 @@ fn custom_shortcuts_and_live_variables() -> TestResult {
         resolver.resolve(&session, &[Chord::alt('v'), Chord::plain('x')]),
         ShortcutOutcome::NoMatch,
     )
+}
+
+// ═══════════════════════════ v4.1: settings, actions, suggestions, copy ═══════════════════════════
+
+const V41_SETTINGS: &str = r#"
+[editor]
+autocomplete = "manual"
+
+[shortcuts.actions]
+suggest = "Ctrl+Down"
+copy_absolute = "Ctrl+Shift+C"
+
+[warnings]
+ERR_SEMANTIC = "warning"
+ERR_SCOPE = "warning"
+ERR_REFERENCE = "error"
+"#;
+
+#[test]
+fn settings_v4_1_sections() -> TestResult {
+    let defaults = EditorSettings::default();
+    check(
+        "autocomplete default",
+        defaults.autocomplete,
+        Autocomplete::Auto,
+    )?;
+    check(
+        "actions default",
+        defaults.actions,
+        ActionShortcuts {
+            suggest: Chord::alt_down(),
+            copy_absolute: Chord::ctrl('c'),
+            copy_relative: Chord::alt('c'),
+        },
+    )?;
+    check("warnings default", defaults.warnings, WarningCodes::NONE)?;
+    let settings = parse(V41_SETTINGS)?;
+    check("manual", settings.autocomplete, Autocomplete::Manual)?;
+    check(
+        "suggest",
+        settings.actions.suggest,
+        Chord::parse("Ctrl+Down").map_err(|e| e.to_string())?,
+    )?;
+    check(
+        "copy_relative default",
+        settings.actions.copy_relative,
+        Chord::alt('c'),
+    )?;
+    check(
+        "warnings",
+        settings.warnings,
+        WarningCodes::NONE
+            .with(ErrorCode::Semantic)
+            .with(ErrorCode::Scope),
+    )?;
+    let rendered = settings.to_toml();
+    check("round trip", parse(&rendered)?, parse(V41_SETTINGS)?)?;
+    check(
+        "Alt+Down key",
+        Chord::parse("Alt+Down").map(|c| c.key),
+        Ok(Key::Down),
+    )?;
+    check(
+        "Down display",
+        Chord::alt_down().to_string(),
+        "Alt+Down".to_owned(),
+    )?;
+    // The warnings feed the parser configuration.
+    let config = crate::ParserConfig {
+        warnings: settings.warnings,
+        ..crate::ParserConfig::default()
+    };
+    let mut session = Session::with_config(config);
+    session
+        .ingest("/^ quata x ^/")
+        .map_err(|d| format!("{d:#?}"))?;
+    Ok(())
+}
+
+#[test]
+fn settings_v4_1_errors() -> TestResult {
+    use SettingsErrorKind as E;
+    expect_settings_error(
+        "[editor]\nautocomplete = \"sometimes\"\n",
+        2,
+        E::InvalidAutocomplete {
+            value: "sometimes".to_owned(),
+        },
+    )?;
+    expect_settings_error(
+        "[editor]\nautocomplete = true\n",
+        2,
+        E::ExpectedString {
+            key: "autocomplete".to_owned(),
+        },
+    )?;
+    expect_settings_error(
+        "[warnings]\nERR_COLOR = \"warning\"\n",
+        2,
+        E::UnknownErrorCode {
+            code: "ERR_COLOR".to_owned(),
+        },
+    )?;
+    expect_settings_error(
+        "[warnings]\nERR_SCOPE = \"maybe\"\n",
+        2,
+        E::InvalidSeverity {
+            value: "maybe".to_owned(),
+        },
+    )?;
+    expect_settings_error(
+        "[shortcuts.actions]\npaste = \"Ctrl+V\"\n",
+        2,
+        E::UnknownKey {
+            table: "shortcuts.actions".to_owned(),
+            key: "paste".to_owned(),
+        },
+    )?;
+    expect_settings_error(
+        "[custom_shortcuts]\n\"Ctrl+C\" = \"x\"\n",
+        2,
+        E::ChordConflict {
+            chord: "Ctrl+C".to_owned(),
+        },
+    )?;
+    expect_settings_error(
+        "[custom_shortcuts]\n\"Alt+Down\" = \"x\"\n",
+        2,
+        E::ChordConflict {
+            chord: "Alt+Down".to_owned(),
+        },
+    )
+}
+
+#[test]
+fn alt_c_ctrl_c_and_alt_down_are_contextual_v4_1() -> TestResult {
+    let settings = EditorSettings::default();
+    let resolver = ShortcutResolver::new(&settings);
+    let session = Session::new();
+    let selected = ShortcutContext { selection: true };
+    let typing = ShortcutContext::default();
+    check(
+        "Alt+C with a selection",
+        resolver.resolve_in(&session, selected, &[Chord::alt('c')]),
+        ShortcutOutcome::CopyRelative,
+    )?;
+    check(
+        "Alt+C while typing",
+        resolver.resolve_in(&session, typing, &[Chord::alt('c')]),
+        ShortcutOutcome::Pending,
+    )?;
+    check(
+        "Alt+C then > while typing",
+        resolver.resolve_in(&session, typing, &[Chord::alt('c'), Chord::plain('>')]),
+        ShortcutOutcome::Insert("cha".to_owned()),
+    )?;
+    check(
+        "Ctrl+C with a selection",
+        resolver.resolve_in(&session, selected, &[Chord::ctrl('c')]),
+        ShortcutOutcome::CopyAbsolute,
+    )?;
+    check(
+        "Ctrl+C without a selection",
+        resolver.resolve_in(&session, typing, &[Chord::ctrl('c')]),
+        ShortcutOutcome::NoMatch,
+    )?;
+    for context in [typing, selected] {
+        check(
+            "Alt+Down",
+            resolver.resolve_in(&session, context, &[Chord::alt_down()]),
+            ShortcutOutcome::Suggest,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn suggestions_recent_glyphs_semas_and_labels_v4_1() -> TestResult {
+    let dti = fixture_with_labels()?;
+    let mut session = Session::new();
+    session
+        .ingest("/^ ta verde nu casa : ta vedere nu Roma ^/ /^ ta valere nu cane ^/")
+        .map_err(|d| format!("{d:#?}"))?;
+    let glyph = |text: &str| Suggestion {
+        kind: SuggestionKind::Glyph,
+        text: text.to_owned(),
+    };
+    let label = |text: &str| Suggestion {
+        kind: SuggestionKind::Label,
+        text: text.to_owned(),
+    };
+    let sema = |text: &str| Suggestion {
+        kind: SuggestionKind::Sema,
+        text: text.to_owned(),
+    };
+    // Most recent first, then semas whose text or signal glyph match.
+    check(
+        "prefix v",
+        suggestions("v", &session, Some(&dti)),
+        vec![
+            glyph("valere"),
+            glyph("vedere"),
+            glyph("verde"),
+            sema("ta valere nu cane"),
+            sema("ta vedere nu Roma"),
+            sema("ta verde nu casa"),
+        ],
+    )?;
+    // Glyph / Label disambiguation for a homonym.
+    check(
+        "homonym",
+        suggestions("cas", &session, Some(&dti)),
+        vec![glyph("casa"), label("casa")],
+    )?;
+    // Labels of the local DTI, also when not written yet.
+    check(
+        "labels",
+        suggestions("R", &session, Some(&dti)),
+        vec![label("Roma")],
+    )?;
+    check(
+        "dimora",
+        suggestions("dim", &session, Some(&dti)),
+        vec![label("dimora")],
+    )?;
+    // The user's choice for a slot wins.
+    let ids = session
+        .ingest("/^ ta x nu casa ^/")
+        .map_err(|d| format!("{d:#?}"))?;
+    let id = ids.first().copied().ok_or("no period")?;
+    let slot = SlotRef {
+        clause: GlobalClause {
+            period: id,
+            clause: ClauseId::new(0),
+        },
+        slot: SlotIndex::new(1),
+    };
+    check("choice", session.set_slot_kind(slot, SlotKind::Label), true)?;
+    check(
+        "chosen kind first",
+        suggestions("cas", &session, Some(&dti)),
+        vec![label("casa"), glyph("casa")],
+    )?;
+    // Without a DTI every token is a glyph.
+    check(
+        "no dti",
+        suggestions("R", &session, None),
+        vec![glyph("Roma")],
+    )
+}
+
+#[test]
+fn copy_subordinates_absolute_and_relative_v4_1() -> TestResult {
+    let text = "/^ ta p nu q :: ta a nu b ::: ta c nu d y :: ta e nu f ^/";
+    let start = text.find(":: ta a").ok_or("no selection")?;
+    let end = text.find(" ^/").ok_or("no end")?;
+    check(
+        "absolute",
+        copy_subordinates(text, start..end, CopyMode::Absolute, Some("blocco")),
+        Ok(CopiedBlock {
+            text: ":: anchor blocco :: ta a nu b ::: ta c nu d y :: ta e nu f :: end ~".to_owned(),
+            id: "blocco".to_owned(),
+        }),
+    )?;
+    check(
+        "relative with generated id",
+        copy_subordinates(text, start..end, CopyMode::Relative, None),
+        Ok(CopiedBlock {
+            text: ":: anchorrel copy1 : ta a nu b :: ta c nu d y : ta e nu f : end ~".to_owned(),
+            id: "copy1".to_owned(),
+        }),
+    )?;
+    // The generated id avoids the tokens of the text.
+    let taken = "/^ ta copy1 nu q : ta a nu b ^/";
+    let start = taken.find(": ta a").ok_or("no selection")?;
+    let end = taken.find(" ^/").ok_or("no end")?;
+    check(
+        "fresh id",
+        copy_subordinates(taken, start..end, CopyMode::Relative, None).map(|c| c.id),
+        Ok("copy2".to_owned()),
+    )?;
+    // A colon run in an even slot is a glyph (Slot Locking).
+    let glyphs = "/^ ta p nu q : ta a nu : ^/";
+    let start = glyphs.find(": ta a").ok_or("no selection")?;
+    let end = glyphs.find(" ^/").ok_or("no end")?;
+    check(
+        "glyph colon",
+        copy_subordinates(glyphs, start..end, CopyMode::Absolute, Some("k")).map(|c| c.text),
+        Ok(": anchor k : ta a nu : : end ~".to_owned()),
+    )?;
+    // The pasted block is valid where it was copied from.
+    let pasted = format!(
+        "/^ ta p nu q {} ^/",
+        copy_subordinates(
+            text,
+            text.find(":: ta a").ok_or("x")?..text.find(" ^/").ok_or("x")?,
+            CopyMode::Relative,
+            Some("k")
+        )
+        .map_err(|e| e.to_string())?
+        .text
+        .replacen("::", ":", 1)
+    );
+    expect_ingest(&pasted)?;
+    // Errors.
+    check(
+        "empty",
+        copy_subordinates(text, 3..3, CopyMode::Absolute, None),
+        Err(CopyError::EmptySelection),
+    )?;
+    check(
+        "not a subordinate",
+        copy_subordinates(text, 3..12, CopyMode::Absolute, None),
+        Err(CopyError::NotSubordinate),
+    )?;
+    let start = text.find(":: ta a").ok_or("no selection")?;
+    check(
+        "incomplete",
+        copy_subordinates(
+            text,
+            start..start.saturating_add(10),
+            CopyMode::Absolute,
+            None,
+        ),
+        Err(CopyError::IncompleteClause),
+    )?;
+    check(
+        "out of range",
+        copy_subordinates(text, 0..10_000, CopyMode::Absolute, None),
+        Err(CopyError::InvalidSelection),
+    )?;
+    check(
+        "invalid id",
+        copy_subordinates(text, start..end_of(text)?, CopyMode::Absolute, Some("~")),
+        Err(CopyError::InvalidId { id: "~".to_owned() }),
+    )
+}
+
+fn end_of(text: &str) -> Result<usize, String> {
+    text.find(" ^/").ok_or_else(|| "no end".to_owned())
 }

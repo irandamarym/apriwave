@@ -8,7 +8,7 @@
 //! 3. the text is submitted to `Session::ingest`, so it cannot escape the
 //!    grammar nor alter the session if it is invalid (atomicity).
 //!
-//! Multiple operands are expressed with `absi` (Q21), never with `§`, which remains the
+//! Multiple operands are expressed with `absi`, never with `§`, which remains the
 //! `root§attribute` qualifier. Example: `/^ ka somma nu sistema a 10 absi 20 ^/`.
 //! Determinism, termination and resource limits are obligations of the evaluator.
 

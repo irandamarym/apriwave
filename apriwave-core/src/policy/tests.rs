@@ -1,7 +1,8 @@
 //! B6/B5 tests: `.awpolicy` loading, the 5 filters, Legacy Shield.
 
+use crate::analyze::{ClauseId, GlobalClause, SlotIndex, SlotRef};
 use crate::dti::{Dti, DtiKey};
-use crate::session::{PeriodId, Session};
+use crate::session::{PeriodId, Session, SlotKind};
 use crate::shield::{LegacyShield, ShieldViolation};
 
 use super::{DtiPolicyManager, PolicyErrorKind, PolicyRule, Requirement};
@@ -49,6 +50,14 @@ fn dti() -> Result<Dti, String> {
         // B9: every concept may be joined by `§` (qualifiers `valvola§priorita`).
         universal.push_str(&format!("rec {} {en} morph:+UNION\n", k(tag)?));
         local.push_str(&format!("use {} form:{it}\n", k(tag)?));
+    }
+    // v4.1 labels: `bassa` is also a glyph (Glyph / Label homonymy).
+    for (tag, form) in [
+        ("labelx", "Xcvb124"),
+        ("labelrm", "rm"),
+        ("labelbassa", "bassa"),
+    ] {
+        local.push_str(&format!("label {} {form}\n", k(tag)?));
     }
     Dti::load(&universal, &local).map_err(|d| format!("{d:#?}"))
 }
@@ -228,23 +237,72 @@ fn role_matrix_thresholds_qualifiers_requirements() -> TestResult {
 fn enhanced_security_and_variables() -> TestResult {
     let dti = dti()?;
     let permissive = policy(&dti, "allow", "")?;
-    let label = "/^ ta porta nu \"Xcvb124\" ^/";
+    // v4.1: a slot is a label only when the user marked it (mandatory
+    // selection), or when it carries a wire label `LVA…`.
+    let label_slot = |id: PeriodId| SlotRef {
+        clause: GlobalClause {
+            period: id,
+            clause: ClauseId::new(0),
+        },
+        slot: SlotIndex::new(1),
+    };
+    let marked = |manager: &DtiPolicyManager, src: &str, kind: SlotKind| {
+        let mut session = Session::new();
+        let id = ingest(&mut session, src)?;
+        if !session.set_slot_kind(label_slot(id), kind) {
+            return Err("choice not recorded".to_owned());
+        }
+        Ok::<Vec<PolicyRule>, String>(match manager.check_period(&session, id, &dti) {
+            Ok(()) => Vec::new(),
+            Err(found) => found.into_iter().map(|v| v.rule).collect(),
+        })
+    };
+    let label = "/^ ta aprire nu Xcvb124 ^/";
     check(
-        "raw allowed",
-        violations(&permissive, &dti, label)?,
+        "label allowed",
+        marked(&permissive, label, SlotKind::Label)?,
         Vec::new(),
     )?;
     let enhanced = policy(&dti, "allow", "")?.with_enhanced_security(true);
     check(
-        "raw blocked",
-        violations(&enhanced, &dti, label)?,
-        vec![PolicyRule::RawLabel],
+        "label blocked",
+        marked(&enhanced, label, SlotKind::Label)?,
+        vec![PolicyRule::Label],
     )?;
-    let allow_door =
-        policy(&dti, "allow", &format!("raw allow:{}\n", k("door")?))?.with_enhanced_security(true);
     check(
-        "raw allowed for door",
-        violations(&allow_door, &dti, label)?,
+        "wire label blocked",
+        violations(&enhanced, &dti, "/^ ta aprire nu LVAAAAXcvb124 ^/")?,
+        vec![PolicyRule::Label],
+    )?;
+    let deny_labels = policy(&dti, "allow", "label deny\n")?;
+    check(
+        "label deny",
+        marked(&deny_labels, label, SlotKind::Label)?,
+        vec![PolicyRule::Label],
+    )?;
+    let allow_open = policy(&dti, "allow", &format!("label allow:{}\n", k("open")?))?
+        .with_enhanced_security(true);
+    check(
+        "label allowed for open",
+        marked(&allow_open, label, SlotKind::Label)?,
+        Vec::new(),
+    )?;
+    // Glyph / Label homonymy: without a selection the slot is a glyph; the
+    // user's selection decides.
+    let homonym = "/^ ta aprire nu bassa ^/";
+    check(
+        "homonym without a choice is a glyph",
+        violations(&enhanced, &dti, homonym)?,
+        Vec::new(),
+    )?;
+    check(
+        "homonym marked as label",
+        marked(&enhanced, homonym, SlotKind::Label)?,
+        vec![PolicyRule::Label],
+    )?;
+    check(
+        "homonym marked as glyph",
+        marked(&enhanced, homonym, SlotKind::Glyph)?,
         Vec::new(),
     )?;
     // Values reached through `def` variables are checked as well.
@@ -357,13 +415,13 @@ fn shield_forwards_canonical_form_and_blocks_violations() -> TestResult {
         Err(found) if matches!(found.first(), Some(ShieldViolation::Grammar(_))) => {}
         other => return Err(format!("expected a grammar block, got {other:?}")),
     }
-    // Enhanced Security is forced on: raw labels are blocked.
-    match shield.filter("/^ ta aprire nu \"rm\" a valvola : tazato porta nu operatore ^/") {
+    // Enhanced Security is forced on: labels are blocked.
+    match shield.filter("/^ ta aprire nu LVAAAArm a valvola : tazato porta nu operatore ^/") {
         Err(found)
             if found.iter().any(
-                |v| matches!(v, ShieldViolation::Policy(p) if p.rule == PolicyRule::RawLabel),
+                |v| matches!(v, ShieldViolation::Policy(p) if p.rule == PolicyRule::Label),
             ) => {}
-        other => return Err(format!("expected a raw-label block, got {other:?}")),
+        other => return Err(format!("expected a label block, got {other:?}")),
     }
     // A blocked `def` does not survive in the shield session.
     let _ = shield.filter("/^ defu x a valvola y ta valvola ^/");

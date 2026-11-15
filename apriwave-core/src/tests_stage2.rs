@@ -2,10 +2,12 @@
 //! No `.unwrap()`: every test returns `Result` and uses `?`.
 
 use crate::analyze::{
-    AnalyzedPeriod, ClauseAnalysis, ClauseId, CoordId, CoordNode, DspRole, GlobalClause,
-    Resolution, SlotAnalysis, SlotIndex, SlotRef, SlotValue,
+    AnalyzedPeriod, ClauseAnalysis, ClauseId, DspRole, GlobalClause, Resolution, SlotAnalysis,
+    SlotIndex, SlotRef, SlotValue,
 };
-use crate::ast::{Comparative, Conditional, Quantifier, QuantumNumber, Temporal, TemporalMode};
+use crate::ast::{
+    Comparative, Conditional, ExplicitNumber, Quantifier, QuantumNumber, Temporal, TemporalMode,
+};
 use crate::error::{Diagnostic, DiagnosticKind, ErrorCode};
 use crate::printer::render_glyph_slot;
 use crate::session::{PeriodId, Session};
@@ -89,7 +91,7 @@ fn pair(
 /// Human-readable text of a resolved value.
 fn value_text(session: &Session, value: SlotValue) -> Result<String, String> {
     match value {
-        SlotValue::Glyph(slot) | SlotValue::Raw(slot) => {
+        SlotValue::Glyph(slot) => {
             let content = session.glyph_slot(slot).ok_or("slot missing")?;
             render_glyph_slot(content, session.interner()).map_err(|e| e.to_string())
         }
@@ -132,28 +134,29 @@ fn check_pair_value(
     )
 }
 
-fn coord_text(period: &AnalyzedPeriod, id: CoordId) -> Result<String, String> {
-    match period.coord(id).ok_or("coordination node missing")? {
-        CoordNode::Clause(clause) => Ok(clause.index().to_string()),
-        CoordNode::Group { conj, members } => {
-            let parts = members
-                .iter()
-                .map(|m| coord_text(period, *m))
-                .collect::<Result<Vec<String>, String>>()?;
-            Ok(format!("{}({})", conj.surface(), parts.join(",")))
-        }
-    }
+/// §9.2 (v4.1): siblings in written order, each with its own conjunction
+/// (`"y 2"`, or `"2"` without a conjunction).
+fn siblings_text(
+    session: &Session,
+    id: PeriodId,
+    siblings: &[ClauseId],
+) -> Result<Vec<String>, String> {
+    siblings
+        .iter()
+        .map(|sibling| {
+            let analysis = clause(session, id, sibling.index())?;
+            Ok(match analysis.conjunction() {
+                Some(conj) => format!("{} {}", conj.surface(), sibling.index()),
+                None => sibling.index().to_string(),
+            })
+        })
+        .collect()
 }
 
-fn groups_text(period: &AnalyzedPeriod, groups: &[CoordId]) -> Result<Vec<String>, String> {
-    groups.iter().map(|g| coord_text(period, *g)).collect()
-}
-
-fn child_groups(src: &str, parent: u32) -> Result<Vec<String>, String> {
+fn child_siblings(src: &str, parent: u32) -> Result<Vec<String>, String> {
     let (session, id) = one(src)?;
-    let period = analysis(&session, id)?;
-    let groups = clause(&session, id, parent)?.groups();
-    groups_text(period, groups)
+    let children = clause(&session, id, parent)?.children();
+    siblings_text(&session, id, children)
 }
 
 fn placement(session: &Session, id: PeriodId, index: u32) -> Result<(u8, Option<u32>), String> {
@@ -213,9 +216,9 @@ fn manual_example_5_anaphora_and_sed() -> TestResult {
         &[ClauseId::new(0), ClauseId::new(2)][..],
     )?;
     check(
-        "root groups",
-        groups_text(period, period.root_groups())?,
-        vec!["sed(0,2)".to_owned()],
+        "root siblings",
+        siblings_text(&s, id, period.roots())?,
+        vec!["0".to_owned(), "sed 2".to_owned()],
     )
 }
 
@@ -242,11 +245,10 @@ fn manual_example_6_dsp_tree_and_anaphora_chain() -> TestResult {
         clause(&s, id, 0)?.children(),
         &[ClauseId::new(1), ClauseId::new(3)][..],
     )?;
-    let period = analysis(&s, id)?;
     // R4b: siblings without a conjunction = distinct branches.
     check(
         "branches of vedere",
-        groups_text(period, clause(&s, id, 0)?.groups())?,
+        siblings_text(&s, id, clause(&s, id, 0)?.children())?,
         vec!["1".to_owned(), "3".to_owned()],
     )
 }
@@ -352,36 +354,45 @@ fn canonical_order_q21() -> TestResult {
 // ═══════════════════════════ Coordination (Q15, R4) ═══════════════════════════
 
 #[test]
-fn coordination_groups() -> TestResult {
+fn coordination_keeps_written_order_v4_1() -> TestResult {
+    // §9.2 (v4.1): no coordination tree; siblings keep the written order, each
+    // with its own conjunction.
     check(
         "IF A AND B",
-        child_groups("/^ ta c : tazato a y : tazato b ^/", 0)?,
-        vec!["y(1,2)".to_owned()],
+        child_siblings("/^ ta c : tazato a y : tazato b ^/", 0)?,
+        vec!["1".to_owned(), "y 2".to_owned()],
     )?;
     check(
         "R4b",
-        child_groups("/^ ta p : ta a : ta b y : ta c ^/", 0)?,
-        vec!["1".to_owned(), "y(2,3)".to_owned()],
+        child_siblings("/^ ta p : ta a : ta b y : ta c ^/", 0)?,
+        vec!["1".to_owned(), "2".to_owned(), "y 3".to_owned()],
     )?;
     check(
-        "homogeneous chain flattened",
-        child_groups("/^ ta p : ta a y : ta b y : ta c ^/", 0)?,
-        vec!["y(1,2,3)".to_owned()],
+        "chain",
+        child_siblings("/^ ta p : ta a y : ta b y : ta c ^/", 0)?,
+        vec!["1".to_owned(), "y 2".to_owned(), "y 3".to_owned()],
     )?;
     check(
-        "mixed chain, left-associative",
-        child_groups("/^ ta p : ta a y : ta b vel : ta c ^/", 0)?,
-        vec!["vel(y(1,2),3)".to_owned()],
+        "mixed chain, no presumed grouping",
+        child_siblings("/^ ta p : ta a y : ta b vel : ta c ^/", 0)?,
+        vec!["1".to_owned(), "y 2".to_owned(), "vel 3".to_owned()],
     )?;
     check(
-        "(a y b) sed c",
-        child_groups("/^ ta p : ta a y : ta b sed : ta c ^/", 0)?,
-        vec!["sed(y(1,2),3)".to_owned()],
+        "sed binds the last element",
+        child_siblings("/^ ta p : ta a y : ta b sed : ta c ^/", 0)?,
+        vec!["1".to_owned(), "y 2".to_owned(), "sed 3".to_owned()],
     )?;
     check(
         "immediate sibling past a deeper branch",
-        child_groups("/^ ta p : ta a :: ta x y : ta b ^/", 0)?,
-        vec!["y(1,3)".to_owned()],
+        child_siblings("/^ ta p : ta a :: ta x y : ta b ^/", 0)?,
+        vec!["1".to_owned(), "y 3".to_owned()],
+    )?;
+    // `sed` without colons returns to level 0.
+    let (s, id) = one("/^ ta p : ta a sed ta b ^/")?;
+    check(
+        "sed roots",
+        analysis(&s, id)?.roots(),
+        &[ClauseId::new(0), ClauseId::new(2)][..],
     )?;
     // R4a: `y` after a transparent `def` has no relational sibling on its left.
     let (s, id) = one("/^ defu dev a sensore§ottico y ta attivare nu dev : ta leggere nu dev ^/")?;
@@ -389,8 +400,8 @@ fn coordination_groups() -> TestResult {
     check("roots", period.roots(), &[ClauseId::new(1)][..])?;
     check(
         "R4a",
-        groups_text(period, period.root_groups())?,
-        vec!["1".to_owned()],
+        siblings_text(&s, id, period.roots())?,
+        vec!["y 1".to_owned()],
     )
 }
 
@@ -441,13 +452,55 @@ fn inheritance_overrides_and_exclusions_q17() -> TestResult {
         Some(TemporalMode::Conditional(Conditional(Temporal::Ato))),
     )?;
 
-    // The comparative is not inherited and does not impose the Accusative on children.
+    // v4.1: the comparative is inherited; Q19 (Accusative required) applies
+    // only to a written comparative.
     let (s, id) = one("/^ tacha x nu y a z : ta k nu w ^/")?;
     let signal = clause(&s, id, 1)?
         .signal()
         .copied()
         .ok_or("signal missing")?;
-    check("comparative", signal.comparative, None)?;
+    check(
+        "inherited comparative",
+        (signal.comparative, signal.comparative_inherited),
+        (Some(Comparative::Cha), true),
+    )?;
+    // An override wins.
+    let (s, id) = one("/^ tacha x nu y a z : tachu k nu w a q ^/")?;
+    let signal = clause(&s, id, 1)?
+        .signal()
+        .copied()
+        .ok_or("signal missing")?;
+    check(
+        "comparative override",
+        (signal.comparative, signal.comparative_inherited),
+        (Some(Comparative::Chu), false),
+    )?;
+    // v4.1: the number of the signal pair is inherited too.
+    let (s, id) = one("/^ tau x nu y : ta k nu w ^/")?;
+    let signal = clause(&s, id, 1)?
+        .signal()
+        .copied()
+        .ok_or("signal missing")?;
+    check(
+        "inherited number",
+        (signal.number, signal.number_inherited),
+        (Some(ExplicitNumber::Singular), true),
+    )?;
+    check(
+        "number of the signal pair",
+        pair(&s, id, 1, 0)?.number(),
+        QuantumNumber::Singular,
+    )?;
+    let (s, id) = one("/^ tau x nu y : tam k nu w ^/")?;
+    let signal = clause(&s, id, 1)?
+        .signal()
+        .copied()
+        .ok_or("signal missing")?;
+    check(
+        "number override",
+        (signal.number, signal.number_inherited),
+        (Some(ExplicitNumber::Plural), false),
+    )?;
 
     // `deep` does not inherit.
     let (s, id) = one("/^ taalt x : deep y ^/")?;
@@ -464,12 +517,9 @@ fn inheritance_overrides_and_exclusions_q17() -> TestResult {
 }
 
 #[test]
-fn inherited_reflexive_forbids_accusative_d8() -> TestResult {
-    expect(
-        "/^ taref x nu io : ta y au z ^/",
-        DiagnosticKind::AccusativeInReflexive,
-        ErrorCode::Syntax,
-    )?;
+fn inherited_reflexive_admits_accusative() -> TestResult {
+    // v4.1: `ref` (written or inherited) admits the Accusative.
+    one("/^ taref x nu io : ta y au z ^/")?;
     let (s, id) = one("/^ taref x nu io : ta y nu z ^/")?;
     let signal = clause(&s, id, 1)?
         .signal()
@@ -483,17 +533,10 @@ fn inherited_reflexive_forbids_accusative_d8() -> TestResult {
 }
 
 #[test]
-fn quantifier_misuse_q20() -> TestResult {
-    expect(
-        "/^ ta p nu q : taall x ^/",
-        DiagnosticKind::QuantifierMisuse,
-        ErrorCode::Scope,
-    )?;
-    expect(
-        "/^ taall p nu q : ta x ^/",
-        DiagnosticKind::QuantifierMisuse,
-        ErrorCode::Scope,
-    )?;
+fn quantifier_without_cases_allowed() -> TestResult {
+    // v4.1: Q20 is abolished.
+    one("/^ ta p nu q : taall x ^/")?;
+    one("/^ taall p nu q : ta x ^/")?;
     one("/^ taallref x ^/")?;
     one("/^ taallref p : ta x ^/")?;
     Ok(())
@@ -632,7 +675,7 @@ fn soft_close_carries_level_zero_r6() -> TestResult {
     // Accumulation across multiple `/^/`, most recent first.
     let (s, id) = one("/^ ta x nu a /^/ /^ ta y nu b /^/ /^ ta z au ~ ^/")?;
     check_pair_value(&s, id, 0, 1, "b")?;
-    let (s, id) = one("/^ ta x au video§rosso /^/ /^ ta y nu b /^/ /^ ta z au video~ ^/")?;
+    let (s, id) = one("/^ ta x au video§rosso /^/ /^ ta z au ~ ^/")?;
     check_pair_value(&s, id, 0, 1, "video§rosso")?;
     // Also across successive ingests.
     let mut session = Session::new();
@@ -663,23 +706,24 @@ fn standard_and_hard_close_clear_anaphora() -> TestResult {
 }
 
 #[test]
-fn prefix_and_inverse_match_r7() -> TestResult {
-    expect(
+fn suffixed_glyphs_are_literal_v4_1() -> TestResult {
+    // v4.1: `base~`, `base§mod~` and `glyph~~` are abolished: such tokens are
+    // ordinary glyphs, resolved literally.
+    for src in [
         "/^ ta r nu sonda au video : ta s au video~ ^/",
-        DiagnosticKind::UnresolvedGlyphAnaphora,
-        ErrorCode::Reference,
-    )?;
-    let (s, id) = one("/^ ta r au video§rosso : ta s nu io :: ta t au video~ ^/")?;
-    check_pair_value(&s, id, 2, 1, "video§rosso")?;
-    let (s, id) = one("/^ ta r nu video au video§rosso : ta s au video§rosso§scuro~ ^/")?;
-    check_pair_value(&s, id, 1, 1, "video§rosso")?;
-    let (s, id) = one("/^ ta r au video : ta s au video§rosso~ ^/")?;
-    check_pair_value(&s, id, 1, 1, "video")?;
-    expect(
-        "/^ ta r au video§rosso : ta s au video§rosso~ ^/",
-        DiagnosticKind::UnresolvedGlyphAnaphora,
-        ErrorCode::Reference,
-    )
+        "/^ ta r au video : ta s au video§rosso~ ^/",
+        "/^ ta x nu canis : ta y :: ta z au canis~~ ^/",
+    ] {
+        let (s, id) = one(src)?;
+        let last = u32::try_from(analysis(&s, id)?.clauses().len().saturating_sub(1))
+            .map_err(|e| e.to_string())?;
+        check(
+            "literal",
+            pair(&s, id, last, 1)?.resolution(),
+            Resolution::Literal,
+        )?;
+    }
+    Ok(())
 }
 
 #[test]
@@ -690,13 +734,14 @@ fn candidate_rules_r9() -> TestResult {
     check_pair_value(&s, id, 2, 1, "a")?;
     let (s, id) = one("/^ ta p nu q : ta x au ~~ :: ta y n ~ ^/")?;
     check_pair_value(&s, id, 2, 1, "x")?;
-    // R9.3: a raw string is valid only for Exact.
+    // v4.1: `"Raw"` is an ordinary glyph, and `video~` is a literal glyph.
     let (s, id) = one("/^ ta x au \"Raw\" : ta y nu ~ ^/")?;
     check_pair_value(&s, id, 1, 1, "\"Raw\"")?;
-    expect(
-        "/^ ta x au \"video\" : ta y au video~ ^/",
-        DiagnosticKind::UnresolvedGlyphAnaphora,
-        ErrorCode::Reference,
+    let (s, id) = one("/^ ta x au \"video\" : ta y au video~ ^/")?;
+    check(
+        "literal glyph",
+        pair(&s, id, 1, 1)?.resolution(),
+        Resolution::Literal,
     )?;
     // R9.4: a live variable as antecedent, with its number.
     let (s, id) = one("/^ defu dev a sensore§ottico y ta x nu dev : ta y n ~ ^/")?;
@@ -706,7 +751,7 @@ fn candidate_rules_r9() -> TestResult {
         pair(&s, id, 2, 1)?.number(),
         QuantumNumber::Singular,
     )?;
-    let (s, id) = one("/^ defu dev a sensore§ottico y ta x au dev : ta y au sensore~ ^/")?;
+    let (s, id) = one("/^ defu dev a sensore§ottico y ta x au dev : ta y au ~ ^/")?;
     check_pair_value(&s, id, 2, 1, "$dev")
 }
 
@@ -747,8 +792,9 @@ fn numbers_and_signal_pair_q18_r10() -> TestResult {
         QuantumNumber::Dual,
     )?;
     // Same antecedent rule in every pair: `~` in the signal pair binds to the last
-    // canonical pair of the antecedent (`nu io`). Rule 1B: the signal pair never
-    // inherits a number, it is Dual unless the signal tile writes one.
+    // canonical pair of the antecedent (`nu io`). Rule 1B (v4.1): the number of
+    // the signal pair is the number written in the signal tile or inherited from
+    // the parent signal; here neither exists, so it is Dual.
     let (s, id) = one("/^ ta vedere nu io : ta ~ nu marco ^/")?;
     let signal_pair = pair(&s, id, 1, 0)?;
     check("value", value_text(&s, signal_pair.value())?.as_str(), "io")?;
@@ -834,14 +880,15 @@ fn anaphora_rules_are_identical_in_every_pair() -> TestResult {
     )?;
     check_pair_value(&s, id, 1, 0, "a")?;
     // The glyph of the signal pair is a candidate like any other.
-    let (s, id) = one("/^ ta video§rosso nu io : ta s au video~ ^/")?;
+    let (s, id) = one("/^ ta video§rosso : ta s au ~ ^/")?;
     check_pair_value(&s, id, 1, 1, "video§rosso")?;
-    // A label in the signal pair is a valid antecedent for `~` (R9.3).
+    // Any glyph token is a valid antecedent for `~`.
     let (s, id) = one("/^ ta \"Xcvb124\" : ta y au ~ ^/")?;
     check_pair_value(&s, id, 1, 1, "\"Xcvb124\"")?;
-    // `glyph~~` finds the glyph in any pair of the antecedent block.
-    let (s, id) = one("/^ ta x nu canis : ta y :: ta z au canis~~ ^/")?;
-    check_pair_value(&s, id, 2, 1, "~~0.0")
+    // `~~` behaves identically in the signal pair and in a case pair.
+    let (s, id) = one("/^ ta x nu canis : ta ~~ au ~~ ^/")?;
+    check_pair_value(&s, id, 1, 0, "~~0.0")?;
+    check_pair_value(&s, id, 1, 1, "~~0.0")
 }
 
 // ═══════════════════════════ Sema anaphora (R8) ═══════════════════════════
@@ -861,20 +908,12 @@ fn sema_anaphora_r8() -> TestResult {
         DiagnosticKind::UnresolvedSemaAnaphora,
         ErrorCode::Reference,
     )?;
-    let (s, id) = one("/^ ta vedere nu io : ta abbaiare nu ~ :: ta vedere~~ ^/")?;
+    // `~~` recalls the immediate antecedent block (the parent).
+    let (s, id) = one("/^ ta vedere nu io : ta abbaiare nu ~ :: ta ~~ ^/")?;
     check(
-        "by glyph",
+        "parent sema",
         value_text(&s, pair(&s, id, 2, 0)?.value())?.as_str(),
-        "~~0.0",
-    )?;
-    // The comparison uses resolved values: `nu ~` → canis makes `canis~~` bindable
-    // to block 1, the most recent one containing it.
-    let (s, id) = one("/^ ta x au canis : ta y nu ~ :: ta k au canis~~ ^/")?;
-    check_pair_value(&s, id, 2, 1, "~~0.1")?;
-    expect(
-        "/^ ta x : ta y nu zzz~~ ^/",
-        DiagnosticKind::UnresolvedSemaAnaphora,
-        ErrorCode::Reference,
+        "~~0.1",
     )
 }
 
@@ -1125,5 +1164,91 @@ fn sema_anaphora_resolves_identically_in_every_slot() -> TestResult {
     one("/^ ta x nu a : tozato ~~ nu b ^/")?;
     one("/^ ta x a y : taref ~~ ^/")?;
     one("/^ ta r : tazato x abdur ~ :: ta ~~ ^/")?;
+    Ok(())
+}
+
+// ═══════════════════════════ v4.1: repeated cases, warnings ═══════════════════════════
+
+#[test]
+fn repeated_cases_keep_the_written_order_v4_1() -> TestResult {
+    let (s, id) = one("/^ ta x au 2 au 1 nu c du d du e ^/")?;
+    check(
+        "stable canonical order",
+        clause(&s, id, 0)?.canonical_order(),
+        &[0, 3, 1, 2, 4, 5][..],
+    )?;
+    // `~` resolves to the last glyph in canonical order (`du e`).
+    let (s, id) = one("/^ ta x au 2 au 1 du d du e : ta y nu ~ ^/")?;
+    check_pair_value(&s, id, 1, 1, "e")
+}
+
+fn config_with(codes: &[ErrorCode]) -> crate::parser::ParserConfig {
+    let mut config = crate::parser::ParserConfig::default();
+    for code in codes {
+        config.warnings = config.warnings.with(*code);
+    }
+    config
+}
+
+#[test]
+fn error_codes_downgraded_to_warnings_v4_1() -> TestResult {
+    // Default: every code is a blocking error.
+    expect(
+        "/^ quata x ^/",
+        DiagnosticKind::SecondarySignalAtRoot,
+        ErrorCode::Scope,
+    )?;
+    // Downgraded code: accepted, the diagnostic is exposed as a warning.
+    let mut session = Session::with_config(config_with(&[ErrorCode::Scope]));
+    let ids = accept(&mut session, "/^ quata x ^/")?;
+    let id = ids.first().copied().ok_or("no period")?;
+    let warnings = analysis(&session, id)?.warnings();
+    check("one warning", warnings.len(), 1)?;
+    let warning = warnings.first().ok_or("no warning")?;
+    check(
+        "warning kind",
+        warning.kind,
+        DiagnosticKind::SecondarySignalAtRoot,
+    )?;
+    check("is warning", warning.is_warning(), true)?;
+    // Unresolved anaphora downgraded (ERR_REFERENCE).
+    let mut session = Session::with_config(config_with(&[ErrorCode::Reference]));
+    let ids = accept(&mut session, "/^ ta x nu a ^/ /^ ta z au ~ ^/")?;
+    let id = ids.last().copied().ok_or("no period")?;
+    check(
+        "reference warning",
+        analysis(&session, id)?
+            .warnings()
+            .iter()
+            .map(|w| w.kind)
+            .collect::<Vec<_>>(),
+        vec![DiagnosticKind::UnresolvedGlyphAnaphora],
+    )?;
+    check(
+        "first period has no warning",
+        analysis(&session, ids.first().copied().ok_or("no period")?)?
+            .warnings()
+            .len(),
+        0,
+    )?;
+    // Structural errors stay blocking even when their code is downgraded.
+    let mut session = Session::with_config(config_with(&ErrorCode::ALL));
+    let diagnostics = reject_in(&mut session, "/^ Ta x ^/")?;
+    check(
+        "structural stays an error",
+        diagnostics.iter().all(|d| !d.is_warning()),
+        true,
+    )?;
+    let diagnostics = reject_in(&mut session, "/^ ta x : end ~ ^/")?;
+    check(
+        "unbalanced anchor stays blocking",
+        diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::EndWithoutAnchor && !d.is_warning()),
+        true,
+    )?;
+    // Another code downgraded does not affect ERR_SCOPE.
+    let mut session = Session::with_config(config_with(&[ErrorCode::Semantic]));
+    reject_in(&mut session, "/^ quata x ^/")?;
     Ok(())
 }

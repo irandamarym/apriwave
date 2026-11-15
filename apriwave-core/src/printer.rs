@@ -9,8 +9,7 @@ use crate::ast::{
     AblativeDeterminer, Case, CaseTile, ClauseBlock, Conditional, DefOperation, DefSignal,
     DefinitionBlock, GlyphAnaphora, GlyphPath, GlyphSlot, Link, LinkedClause, Period,
     PortabilityBlock, Reflexive, RelationalBlock, RelationalSignal, SemaAnaphora,
-    SignalDeterminers, TemporalMode, ANAPHORA_MARK, DEEP_SURFACE, QUALIFIER_SEPARATOR,
-    RAW_STRING_QUOTE, SEMA_ANAPHORA_MARK,
+    SignalDeterminers, TemporalMode, ANAPHORA_MARK, DEEP_SURFACE, SEMA_ANAPHORA_MARK,
 };
 use crate::symbol::{Interner, Symbol};
 
@@ -28,17 +27,15 @@ impl core::error::Error for UnknownSymbol {}
 
 /// Maps the glyph content of even slots (and the other glyph operands) to text.
 ///
-/// The structure of the period (tiles, connectors, anaphora marks, quotes) is
-/// always written by the printer; only glyphs go through the map. The lexical map
-/// writes the interned text; the indexed wire form (stage 3) writes DTI keys.
+/// The structure of the period (tiles, connectors, anaphora marks) is always
+/// written by the printer; only glyphs go through the map. The lexical map writes
+/// the interned text; the indexed wire form (stage 3) writes DTI keys or labels.
 pub(crate) trait GlyphMap {
     type Error;
-    /// A whole glyph path (`glyph§attr`): slot glyphs, `glyph~~` bases, portability ids.
+    /// A glyph token: slot glyphs and portability ids.
     fn path(&mut self, path: &GlyphPath, site: GlyphSite) -> Result<String, Self::Error>;
-    /// A single atom: `def` variable names and the atoms of `base~` / `base§mod~`.
+    /// The name of a `def` variable (the whole glyph token).
     fn atom(&mut self, atom: Symbol, site: GlyphSite) -> Result<String, Self::Error>;
-    /// Content of a raw string (written between quotes by the printer).
-    fn raw(&mut self, content: Symbol) -> Result<String, Self::Error>;
 }
 
 /// Where a glyph operand appears (lets a map treat bound symbols specially).
@@ -50,8 +47,8 @@ pub(crate) enum GlyphSite {
     DefName,
     /// Id of a portability block.
     PortabilityId,
-    /// Atoms of `base~` / `base§mod~` and the path of `glyph~~`.
-    AnaphoraBase,
+    /// A glyph rendered outside a period.
+    Standalone,
 }
 
 /// Lexical map: the interned text of every glyph.
@@ -70,20 +67,11 @@ impl GlyphMap for LexicalMap<'_> {
     type Error = UnknownSymbol;
 
     fn path(&mut self, path: &GlyphPath, _site: GlyphSite) -> Result<String, UnknownSymbol> {
-        let mut out = self.text(path.root)?;
-        for qualifier in path.qualifiers.iter() {
-            out.push(QUALIFIER_SEPARATOR);
-            out.push_str(&self.text(*qualifier)?);
-        }
-        Ok(out)
+        self.text(path.text)
     }
 
     fn atom(&mut self, atom: Symbol, _site: GlyphSite) -> Result<String, UnknownSymbol> {
         self.text(atom)
-    }
-
-    fn raw(&mut self, content: Symbol) -> Result<String, UnknownSymbol> {
-        self.text(content)
     }
 }
 
@@ -93,37 +81,10 @@ pub(crate) fn map_slot<M: GlyphMap + ?Sized>(
     slot: &GlyphSlot,
     site: GlyphSite,
 ) -> Result<String, M::Error> {
-    let base = GlyphSite::AnaphoraBase;
     Ok(match slot {
         GlyphSlot::Glyph(path) => map.path(path, site)?,
-        GlyphSlot::RawString(content) => {
-            let mut out = String::new();
-            out.push(RAW_STRING_QUOTE);
-            out.push_str(&map.raw(*content)?);
-            out.push(RAW_STRING_QUOTE);
-            out
-        }
         GlyphSlot::GlyphAnaphora(GlyphAnaphora::Exact) => ANAPHORA_MARK.to_string(),
-        GlyphSlot::GlyphAnaphora(GlyphAnaphora::Prefix { base }) => {
-            let mut out = map.atom(*base, GlyphSite::AnaphoraBase)?;
-            out.push(ANAPHORA_MARK);
-            out
-        }
-        GlyphSlot::GlyphAnaphora(GlyphAnaphora::Inverse { base, qualifiers }) => {
-            let mut out = map.atom(*base, GlyphSite::AnaphoraBase)?;
-            for qualifier in qualifiers.iter() {
-                out.push(QUALIFIER_SEPARATOR);
-                out.push_str(&map.atom(*qualifier, GlyphSite::AnaphoraBase)?);
-            }
-            out.push(ANAPHORA_MARK);
-            out
-        }
         GlyphSlot::SemaAnaphora(SemaAnaphora::Latest) => SEMA_ANAPHORA_MARK.to_owned(),
-        GlyphSlot::SemaAnaphora(SemaAnaphora::ByGlyph { glyph }) => {
-            let mut out = map.path(glyph, base)?;
-            out.push_str(SEMA_ANAPHORA_MARK);
-            out
-        }
     })
 }
 
@@ -333,12 +294,12 @@ pub(crate) fn render_period_with<M: GlyphMap + ?Sized>(
 
 /// Surface form of a glyph path (`glyph§attr1§attr2`).
 pub fn render_glyph_path(path: &GlyphPath, interner: &Interner) -> Result<String, UnknownSymbol> {
-    LexicalMap(interner).path(path, GlyphSite::AnaphoraBase)
+    LexicalMap(interner).path(path, GlyphSite::Standalone)
 }
 
 /// Surface form of the content of an even slot.
 pub fn render_glyph_slot(slot: &GlyphSlot, interner: &Interner) -> Result<String, UnknownSymbol> {
-    map_slot(&mut LexicalMap(interner), slot, GlyphSite::AnaphoraBase)
+    map_slot(&mut LexicalMap(interner), slot, GlyphSite::Standalone)
 }
 
 /// Single-line canonical form of the period.

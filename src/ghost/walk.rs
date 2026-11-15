@@ -27,8 +27,8 @@
 //!
 //! # Why anaphora resolve identically
 //!
-//! An anaphora base (`base~`, `base§mod~`, `glyph~~`) is compared with the atoms
-//! of the value paths of the visible blocks, which are all held. Every live entry
+//! The antecedent search (`~`, `~~`) compares the atoms of the value paths of
+//! the visible blocks, which are all held. Every live entry
 //! is a binding, so `cipher(x) = cipher(y) ⇔ plain(x) = plain(y)` for every atom
 //! compared by the R6–R8 search; therefore the ciphertext resolves every
 //! anaphora to the same antecedent, the base atoms automatically take the cipher
@@ -106,7 +106,7 @@ fn parse_known(text: &str) -> Result<Atom, GhostError> {
 }
 
 /// Rule 5: an ephemeral key may only be a bound symbol: `def` name,
-/// portability-id atom, or R13 reference (atomic glyph of a relational pair
+/// portability-id atom, or R13 reference (glyph of a relational pair
 /// resolved by stage 2 as a live variable).
 pub fn check_ephemeral(view: &PeriodView<'_>, snapshot: &Snapshot<'_>) -> Result<(), GhostError> {
     for (index, (site, role)) in view
@@ -180,7 +180,7 @@ impl PeriodView<'_> {
     }
 
     /// Literal glyph slots of the value paths of a value (R7: variable values
-    /// in any order; raw strings and semas have no path).
+    /// in any order; semas have no path).
     fn literal_slots(&self, value: SlotValue) -> Vec<SlotRef> {
         let is_glyph =
             |slot: &SlotRef| matches!(self.analysis.glyph_slot(*slot), Some(GlyphSlot::Glyph(_)));
@@ -200,7 +200,7 @@ impl PeriodView<'_> {
                         .collect()
                 })
                 .unwrap_or_default(),
-            SlotValue::Glyph(_) | SlotValue::Raw(_) | SlotValue::Sema(_) => Vec::new(),
+            SlotValue::Glyph(_) | SlotValue::Sema(_) => Vec::new(),
         }
     }
 }

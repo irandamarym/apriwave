@@ -2,19 +2,21 @@
 //!
 //! Dependency-free JSON serializer: field order is fixed and escaping
 //! covers `"`, `\`, all control characters and U+2028/U+2029, so for the same
-//! session the output is byte-for-byte identical. DTI references will be added
-//! with stage 3.
+//! session the output is byte-for-byte identical. v4.1: coordination is no
+//! longer a structure (coordinated clauses are siblings in written order, each
+//! with its own conjunction), every slot reports the Glyph / Label choice of
+//! the user and the period lists its warnings.
 
 use crate::analyze::{
-    AnalyzedPeriod, ClauseAnalysis, CoordNode, DspRole, GlobalClause, Resolution, SlotAnalysis,
-    SlotIndex, SlotRef, SlotValue,
+    ClauseAnalysis, ClauseId, DspRole, GlobalClause, Resolution, SlotAnalysis, SlotIndex, SlotRef,
+    SlotValue,
 };
 use crate::ast::{
     Case, ClauseRef, Conditional, Conjunction, DefOperation, ExplicitNumber, GlyphSlot,
     PortabilityBlock, QuantumNumber, TemporalMode, ANAPHORA_MARK,
 };
 use crate::printer::{self, render_glyph_path, render_glyph_slot};
-use crate::session::{PeriodId, Session};
+use crate::session::{PeriodId, Session, SlotKind};
 use crate::symbol::Symbol;
 
 use std::fmt;
@@ -202,17 +204,6 @@ impl Exporter<'_> {
                     ("ref", slot_ref_json(slot)),
                 ])
             }
-            SlotValue::Raw(slot) => {
-                let text = match self.session.glyph_slot(slot) {
-                    Some(GlyphSlot::RawString(content)) => Json::Str(self.symbol(*content)?),
-                    _ => Json::Null,
-                };
-                Json::Obj(vec![
-                    ("kind", Json::str("raw")),
-                    ("text", text),
-                    ("ref", slot_ref_json(slot)),
-                ])
-            }
             SlotValue::Variable(id) => {
                 let mut fields = vec![
                     ("kind", Json::str("variable")),
@@ -239,7 +230,12 @@ impl Exporter<'_> {
         })
     }
 
-    fn slot(&self, analysis: &SlotAnalysis, written: &GlyphSlot) -> Result<Json, ExportError> {
+    fn slot(
+        &self,
+        at: SlotRef,
+        analysis: &SlotAnalysis,
+        written: &GlyphSlot,
+    ) -> Result<Json, ExportError> {
         let resolution = match analysis.resolution() {
             Resolution::Literal => Json::Obj(vec![("kind", Json::str("literal"))]),
             Resolution::Variable { binding } => Json::Obj(vec![
@@ -263,6 +259,14 @@ impl Exporter<'_> {
             ("resolution", resolution),
             ("value", self.value(analysis.value(), true)?),
             ("number", Json::str(number_name(analysis.number()))),
+            (
+                "slot_kind",
+                match self.session.slot_kind(at) {
+                    Some(SlotKind::Glyph) => Json::str("glyph"),
+                    Some(SlotKind::Label) => Json::str("label"),
+                    None => Json::Null,
+                },
+            ),
         ]))
     }
 
@@ -278,10 +282,15 @@ impl Exporter<'_> {
 
     fn clause(
         &self,
-        index: u32,
+        at: GlobalClause,
         block: ClauseRef<'_>,
         analysis: &ClauseAnalysis,
     ) -> Result<Json, ExportError> {
+        let index = at.clause.index();
+        let slot_ref = |position: u32| SlotRef {
+            clause: at,
+            slot: SlotIndex::new(position),
+        };
         let mut fields = Self::header(index, clause_kind(block), analysis);
         match block {
             ClauseRef::Relational(block) => {
@@ -298,16 +307,6 @@ impl Exporter<'_> {
                             .children()
                             .iter()
                             .map(|c| Json::num(c.index()))
-                            .collect(),
-                    ),
-                ));
-                fields.push((
-                    "groups",
-                    Json::Arr(
-                        analysis
-                            .groups()
-                            .iter()
-                            .map(|g| Json::num(g.index()))
                             .collect(),
                     ),
                 ));
@@ -337,12 +336,21 @@ impl Exporter<'_> {
                                 Json::opt_str(signal.comparative.map(|c| c.surface())),
                             ),
                             (
+                                "comparative_inherited",
+                                Json::Bool(signal.comparative_inherited),
+                            ),
+                            (
                                 "tense",
                                 signal
                                     .tense
                                     .map_or(Json::Null, |t| Json::Str(tense_surface(t))),
                             ),
                             ("tense_inherited", Json::Bool(signal.tense_inherited)),
+                            (
+                                "number",
+                                Json::opt_str(signal.number.map(ExplicitNumber::surface)),
+                            ),
+                            ("number_inherited", Json::Bool(signal.number_inherited)),
                         ]),
                     ));
                 }
@@ -377,7 +385,9 @@ impl Exporter<'_> {
                     ];
                     match analysis.slot(SlotIndex::new(position)) {
                         Some(slot) => {
-                            if let Json::Obj(rest) = self.slot(slot, &glyph.node)? {
+                            if let Json::Obj(rest) =
+                                self.slot(slot_ref(position), slot, &glyph.node)?
+                            {
                                 entry.extend(rest);
                             }
                         }
@@ -432,7 +442,7 @@ impl Exporter<'_> {
                     ];
                     match (slot, written) {
                         (Some(slot), Some(written)) => {
-                            entry.push(("value", self.slot(slot, written)?));
+                            entry.push(("value", self.slot(slot_ref(position), slot, written)?));
                         }
                         _ => entry.push(("value", Json::Null)),
                     }
@@ -455,33 +465,6 @@ impl Exporter<'_> {
             }
         }
         Ok(Json::Obj(fields))
-    }
-
-    fn coordination(analysis: &AnalyzedPeriod) -> Json {
-        let mut nodes = Vec::new();
-        let mut index: u32 = 0;
-        while let Some(node) = analysis.coord(crate::analyze::CoordId::new(index)) {
-            let entry = match node {
-                CoordNode::Clause(clause) => Json::Obj(vec![
-                    ("id", Json::num(index)),
-                    ("clause", Json::num(clause.index())),
-                ]),
-                CoordNode::Group { conj, members } => Json::Obj(vec![
-                    ("id", Json::num(index)),
-                    ("conj", Json::str(conj.surface())),
-                    (
-                        "members",
-                        Json::Arr(members.iter().map(|m| Json::num(m.index())).collect()),
-                    ),
-                ]),
-            };
-            nodes.push(entry);
-            let Some(next) = index.checked_add(1) else {
-                break;
-            };
-            index = next;
-        }
-        Json::Arr(nodes)
     }
 }
 
@@ -507,7 +490,11 @@ pub fn export_analyzed_json(session: &Session, id: PeriodId) -> Result<String, E
         let block = period
             .clause(index)
             .ok_or(ExportError::ClauseNotFound(index))?;
-        clauses.push(exporter.clause(index, block, clause_analysis)?);
+        let at = GlobalClause {
+            period: id,
+            clause: ClauseId::new(index),
+        };
+        clauses.push(exporter.clause(at, block, clause_analysis)?);
     }
 
     let document = Json::Obj(vec![
@@ -524,18 +511,24 @@ pub fn export_analyzed_json(session: &Session, id: PeriodId) -> Result<String, E
                     .collect(),
             ),
         ),
+        ("clauses", Json::Arr(clauses)),
         (
-            "root_groups",
+            "warnings",
             Json::Arr(
                 analysis
-                    .root_groups()
+                    .warnings()
                     .iter()
-                    .map(|g| Json::num(g.index()))
+                    .map(|warning| {
+                        Json::Obj(vec![
+                            ("code", Json::str(warning.kind.code().as_str())),
+                            ("message", Json::Str(warning.kind.to_string())),
+                            ("start", Json::num(warning.span.start)),
+                            ("end", Json::num(warning.span.end)),
+                        ])
+                    })
                     .collect(),
             ),
         ),
-        ("coordination", Exporter::coordination(analysis)),
-        ("clauses", Json::Arr(clauses)),
     ]);
     let mut out = String::new();
     document.write(&mut out);

@@ -1,11 +1,12 @@
-//! # ApriWave core (ApricotWave Protocol v4.0) — `no_std` + `alloc`
+//! # ApriWave core (GHLIP Protocol v4.1) — `no_std` + `alloc`
 //!
 //! Stage 1: segmentation-only lexer, positional `[Tile] [Glyph]` parser, AST that
 //! mirrors the grammar, block-local checks, canonical rendering.
 //!
 //! Stage 2: DSP tree with anchors, determiner inheritance, glyph and sema
-//! anaphora, `def` variable lifecycle, coordination and the 3-level close
-//! semantics.
+//! anaphora (`~`, `~~`), `def` variable lifecycle, siblings in written order with
+//! their own conjunctions and the 3-level close semantics; per-code downgrade of
+//! diagnostics to warnings (v4.1).
 //!
 //! Stage 3, two-level DTI (on buffers), execution plan, policy manager and the
 //! Legacy Shield filter.
@@ -63,9 +64,9 @@ pub mod tiles;
 mod validate;
 pub mod validator;
 
-pub use error::{Diagnostic, DiagnosticKind, ErrorCode};
+pub use error::{Diagnostic, DiagnosticKind, ErrorCode, Severity, WarningCodes};
 pub use parser::{ParserConfig, DEFAULT_MAX_DSP_DEPTH, DEFAULT_MAX_LOOP_ITERATIONS};
-pub use session::{PeriodId, Session};
+pub use session::{PeriodId, Session, SlotKind};
 
 #[cfg(test)]
 mod tests;

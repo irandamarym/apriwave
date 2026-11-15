@@ -7,7 +7,7 @@ use core::fmt;
 
 use crate::span::Span;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ErrorCode {
     Syntax,
     Order,
@@ -18,6 +18,31 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
+    pub const ALL: [Self; 6] = [
+        Self::Syntax,
+        Self::Order,
+        Self::Reference,
+        Self::Semantic,
+        Self::Scope,
+        Self::CaseAmbiguity,
+    ];
+
+    /// The code with the given official name (`ERR_SEMANTIC` → `Semantic`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|code| code.as_str() == name)
+    }
+
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Syntax => 1,
+            Self::Order => 2,
+            Self::Reference => 4,
+            Self::Semantic => 8,
+            Self::Scope => 16,
+            Self::CaseAmbiguity => 32,
+        }
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Syntax => "ERR_SYNTAX",
@@ -33,6 +58,54 @@ impl ErrorCode {
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Severity of a diagnostic (§15). Every code is an error unless the
+/// configuration downgrades it individually ([`WarningCodes`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Severity {
+    /// Blocking: the input is rejected.
+    #[default]
+    Error,
+    /// Downgraded by the user's configuration, at their own risk: recorded and
+    /// exposed, the period is accepted.
+    Warning,
+}
+
+/// Set of error codes the user has individually downgraded to warnings
+/// (default: empty, every code is blocking). Structural diagnostics, which
+/// prevent building a complete and coherent tree, stay blocking anyway
+/// ([`DiagnosticKind::is_structural`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct WarningCodes(u8);
+
+impl WarningCodes {
+    pub const NONE: Self = Self(0);
+
+    /// Same set with `code` downgraded to a warning.
+    #[must_use]
+    pub const fn with(self, code: ErrorCode) -> Self {
+        Self(self.0 | code.bit())
+    }
+
+    /// Same set with `code` restored as an error.
+    #[must_use]
+    pub const fn without(self, code: ErrorCode) -> Self {
+        Self(self.0 & !code.bit())
+    }
+
+    pub const fn contains(self, code: ErrorCode) -> bool {
+        self.0 & code.bit() != 0
+    }
+
+    /// Severity of a diagnostic of kind `kind` under this configuration.
+    pub const fn severity(self, kind: &DiagnosticKind) -> Severity {
+        if self.contains(kind.code()) && !kind.is_structural() {
+            Severity::Warning
+        } else {
+            Severity::Error
+        }
     }
 }
 
@@ -92,16 +165,8 @@ impl Expected {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GlyphFault {
-    EmptySegment,
-    IllegalCharacter {
-        ch: char,
-    },
-    UnterminatedRawString,
-    QuoteInsideRawString,
-    /// D9: control (`Cc`) or format/bidi character inside a raw string.
-    ForbiddenRawCharacter {
-        ch: char,
-    },
+    /// D9: invisible control (`Cc`) or format/bidi character inside a glyph.
+    InvisibleCharacter { ch: char },
 }
 
 /// Resource limits (all mapped to `ERR_SCOPE`, consistently with Q13).
@@ -111,7 +176,7 @@ pub enum Limit {
     DspDepth,
     SymbolSpace,
     PeriodCount,
-    /// Clause, pair, binding or coordination-node indices beyond `u32::MAX`.
+    /// Clause, pair or binding indices beyond `u32::MAX`.
     IndexSpace,
     /// `abdur=<N>` count or loop-generated plan steps beyond `max_loop_iterations` (B2, L5).
     LoopIterations,
@@ -143,8 +208,8 @@ pub enum DiagnosticKind {
         fault: GlyphFault,
     },
     SignalTileWithoutGlyph,
-    AccusativeInReflexive,
-    DefNameNotAtomic,
+    /// The name of a `def` variable is `~` or `~~` instead of a glyph.
+    DefNameNotAGlyph,
     DefOperationNotAllowed,
     UnbindRequiresTilde,
     PortabilityOperandInvalid,
@@ -181,13 +246,12 @@ pub enum DiagnosticKind {
     },
     EndWithoutAnchor,
     UnclosedAnchor,
-    QuantifierMisuse,
     SecondarySignalAtRoot,
-    /// B2: bare `abdur` outside a subordinate clause with a written conditional.
+    /// B2: bare `abdur` outside a subordinate clause with a (written or
+    /// inherited) conditional.
     LoopMarkerOutsideConditional,
     // ── ERR_CASE_AMBIGUITY ──
     CaseTileWithoutGlyph,
-    DuplicateCase,
 }
 
 impl DiagnosticKind {
@@ -206,8 +270,7 @@ impl DiagnosticKind {
             | Self::UnknownCaseTile
             | Self::MalformedGlyph { .. }
             | Self::SignalTileWithoutGlyph
-            | Self::AccusativeInReflexive
-            | Self::DefNameNotAtomic
+            | Self::DefNameNotAGlyph
             | Self::DefOperationNotAllowed
             | Self::UnbindRequiresTilde
             | Self::PortabilityOperandInvalid
@@ -230,10 +293,56 @@ impl DiagnosticKind {
             | Self::DspLevelSkip { .. }
             | Self::EndWithoutAnchor
             | Self::UnclosedAnchor
-            | Self::QuantifierMisuse
             | Self::SecondarySignalAtRoot
             | Self::LoopMarkerOutsideConditional => ErrorCode::Scope,
-            Self::CaseTileWithoutGlyph | Self::DuplicateCase => ErrorCode::CaseAmbiguity,
+            Self::CaseTileWithoutGlyph => ErrorCode::CaseAmbiguity,
+        }
+    }
+
+    /// `true` for the diagnostics that prevent building a complete and coherent
+    /// tree: they stay blocking even when their code is downgraded (§15). These
+    /// are the stage-1 failures (no block can be built), the DSP placement and
+    /// anchor failures, the resource limits and `def` blocks without operations.
+    pub const fn is_structural(&self) -> bool {
+        match self {
+            Self::InvalidWhitespace
+            | Self::UppercaseCharacter { .. }
+            | Self::ForbiddenSeparator { .. }
+            | Self::MissingPeriodOpen
+            | Self::MissingPeriodClose
+            | Self::UnexpectedEnd { .. }
+            | Self::UnexpectedToken { .. }
+            | Self::UnknownSignalTile
+            | Self::MissingPrimaryAfterSecondary
+            | Self::DeterminerOnDef
+            | Self::UnknownCaseTile
+            | Self::MalformedGlyph { .. }
+            | Self::SignalTileWithoutGlyph
+            | Self::DefNameNotAGlyph
+            | Self::DefOperationNotAllowed
+            | Self::UnbindRequiresTilde
+            | Self::PortabilityOperandInvalid
+            | Self::EndRequiresTilde
+            | Self::PortabilityWithCasePairs
+            | Self::DeterminerOutOfOrder { .. }
+            | Self::DuplicateDeterminer { .. }
+            | Self::DefWithoutOperations
+            | Self::PortabilityOutsideSubordination
+            | Self::LimitExceeded { .. }
+            | Self::DspLevelSkip { .. }
+            | Self::EndWithoutAnchor
+            | Self::UnclosedAnchor
+            | Self::CaseTileWithoutGlyph => true,
+            Self::UnresolvedGlyphAnaphora
+            | Self::UnresolvedSemaAnaphora
+            | Self::UnknownAnchor
+            | Self::UndefinedVariable
+            | Self::ComparativeWithoutAccusative
+            | Self::AssignToLiveVariable
+            | Self::VariableNumberMismatch
+            | Self::SynchronizedOpenWithoutAntecedent
+            | Self::SecondarySignalAtRoot
+            | Self::LoopMarkerOutsideConditional => false,
         }
     }
 }
@@ -263,28 +372,15 @@ impl fmt::Display for DiagnosticKind {
             }
             Self::UnknownCaseTile => f.write_str("unknown case tile"),
             Self::MalformedGlyph { fault } => match fault {
-                GlyphFault::EmptySegment => {
-                    f.write_str("malformed glyph: empty segment around '§'")
-                }
-                GlyphFault::IllegalCharacter { ch } => {
-                    write!(f, "malformed glyph: character not allowed '{ch}'")
-                }
-                GlyphFault::UnterminatedRawString => f.write_str("unterminated raw string"),
-                GlyphFault::QuoteInsideRawString => {
-                    f.write_str("raw string with disallowed inner quotes")
-                }
-                GlyphFault::ForbiddenRawCharacter { ch } => write!(
+                GlyphFault::InvisibleCharacter { ch } => write!(
                     f,
-                    "raw string with disallowed control or format character U+{:04X}",
+                    "glyph with an invisible control or format character U+{:04X}",
                     u32::from(*ch)
                 ),
             },
             Self::SignalTileWithoutGlyph => f.write_str("signal tile not followed by a glyph"),
-            Self::AccusativeInReflexive => {
-                f.write_str("Accusative case not allowed in a ref block")
-            }
-            Self::DefNameNotAtomic => {
-                f.write_str("the name of a def variable must be an atomic glyph without '§'")
+            Self::DefNameNotAGlyph => {
+                f.write_str("the name of a def variable must be a glyph, not an anaphora")
             }
             Self::DefOperationNotAllowed => {
                 f.write_str("only a/au/am/anum, abfi, absi, abse ~ are allowed in a def block")
@@ -340,14 +436,11 @@ impl fmt::Display for DiagnosticKind {
             Self::UnclosedAnchor => {
                 f.write_str("anchor not closed by end ~ before the end of the period")
             }
-            Self::QuantifierMisuse => {
-                f.write_str("quantifier in a block that has no case pairs and is not reflexive")
-            }
             Self::SecondarySignalAtRoot => {
                 f.write_str("secondary signal not allowed at DSP level 0")
             }
             Self::LoopMarkerOutsideConditional => f.write_str(
-                "loop marker `abdur` without `=<N>` is allowed only in a subordinate clause with a written conditional",
+                "loop marker `abdur` without `=<N>` is allowed only in a subordinate clause with a conditional",
             ),
             Self::SynchronizedOpenWithoutAntecedent => {
                 f.write_str("/^≈ and /^≃ require an antecedent period in the session")
@@ -364,7 +457,6 @@ impl fmt::Display for DiagnosticKind {
                 Limit::LoopIterations => f.write_str("loop iterations beyond the configured limit"),
             },
             Self::CaseTileWithoutGlyph => f.write_str("case tile not followed by a glyph"),
-            Self::DuplicateCase => f.write_str("duplicate case in the same block"),
         }
     }
 }
@@ -373,11 +465,30 @@ impl fmt::Display for DiagnosticKind {
 pub struct Diagnostic {
     pub kind: DiagnosticKind,
     pub span: Span,
+    pub severity: Severity,
 }
 
 impl Diagnostic {
+    /// A blocking diagnostic (`Severity::Error`).
     pub const fn new(kind: DiagnosticKind, span: Span) -> Self {
-        Self { kind, span }
+        Self {
+            kind,
+            span,
+            severity: Severity::Error,
+        }
+    }
+
+    /// Same diagnostic with the severity given by `warnings`.
+    #[must_use]
+    pub const fn graded(self, warnings: WarningCodes) -> Self {
+        Self {
+            severity: warnings.severity(&self.kind),
+            ..self
+        }
+    }
+
+    pub const fn is_warning(&self) -> bool {
+        matches!(self.severity, Severity::Warning)
     }
 
     pub const fn code(&self) -> ErrorCode {
@@ -387,9 +498,13 @@ impl Diagnostic {
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let level = match self.severity {
+            Severity::Error => "",
+            Severity::Warning => " warning",
+        };
         write!(
             f,
-            "[{}] byte {}..{}: {}",
+            "[{}{level}] byte {}..{}: {}",
             self.code(),
             self.span.start,
             self.span.end,
