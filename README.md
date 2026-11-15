@@ -22,8 +22,11 @@ pairs:
 - **Tiles** form a closed, fixed set of grammatical tools: signals, determiners,
   cases, numbers, connectors and period delimiters.
 - **Glyphs** are the content, and belong to a dictionary of concepts, the **DTI**.
-  A glyph may contain any visible character: by *Slot Locking* every token in an
-  even slot is a glyph, except the two anaphora operators `~` and `~~`.
+  A glyph may contain any visible character. One rule holds for every token in
+  an even slot (*Slot Locking*), whatever its characters (`^/`, `:`, `§`, `~`,
+  `~~` included): its role (Glyph, Label or Anaphora) is fixed by the annotation
+  of the slot; an unannotated slot is an anaphora for the exact tokens `~` / `~~`
+  and a glyph for every other token.
 
 ```text
 /^ ta vedere nu io au canis : ta abbaiare nu ~ ^/
@@ -41,8 +44,9 @@ The grammar is a mechanical, deterministic and neutral engine: it never judges t
 content of a glyph and guides the user without arbitrary bans.
 
 - Glyphs and DTI forms admit any visible character (`§` included: a censused
-  `a§b` is one glyph); only invisible control and format/bidi characters are
-  refused.
+  `a§b` is one glyph; `~` and `~~` included like any other form, their role
+  being fixed by the slot annotation of `Session::ingest_with_choices`); only invisible control and
+  format/bidi characters are refused.
 - Labels replace the old quoted strings: `label <KEY> <form>` in the local DTI,
   transmitted as `LVAAAA<form>`; the same form may be both a glyph and a label,
   and the editor asks which one applies.
@@ -214,6 +218,13 @@ The technical manual is the reference for the grammar, the engine and every modu
 - Italian (normative edition): [`docs/Manuale_Tecnico_ApriWave_v4.1.md`](docs/Manuale_Tecnico_ApriWave_v4.1.md)
 
 In case of discrepancy, the Italian edition prevails.
+
+The grammatical and explanatory manual presents every rule for an external reader
+(the problem, the solution, the formal rule, a worked example), without internal
+decision codes:
+
+- English: [`docs/Grammatical_and_Explanatory_Manual_ApriWave_v4.1_EN.md`](docs/Grammatical_and_Explanatory_Manual_ApriWave_v4.1_EN.md)
+- Italian: [`docs/Manuale_Grammaticale_e_Divulgativo_ApriWave_v4.1_IT.md`](docs/Manuale_Grammaticale_e_Divulgativo_ApriWave_v4.1_IT.md)
 
 ## License
 

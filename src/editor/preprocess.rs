@@ -9,7 +9,8 @@
 //! glyph (even slot), then case tiles / connectors / closes (odd) alternating
 //! with glyphs (even). Every token of an even slot is a glyph — period
 //! delimiters, colon runs, braces and `"` included — except the two exact
-//! anaphora operators `~` and `~~`. Conjunctions and case tiles are recognized
+//! anaphora operators `~` and `~~` when the slot is not annotated as a glyph or
+//! a label. Conjunctions and case tiles are recognized
 //! only in odd slots.
 //!
 //! Decision E (option 1): the canonical text admits only DTI **primary forms**.
@@ -21,9 +22,17 @@
 //! slots only) are resolved to the primary form as well. Stage 3 resolves
 //! primary forms only.
 //!
-//! Glyph / Label choice (v4.1): for every form that the local DTI holds as a
-//! label the user must select **Glyph** or **Label** in the editor; the editor
-//! passes the choices ([`SlotChoice`]) to [`preprocess_with_choices`]. A slot
+//! Slot roles (v4.1), one rule for every even-slot token whatever its
+//! characters (`~` and `~~` included): the role of the token (**Glyph**,
+//! **Label** or **Anaphora**) is fixed by the annotation of its slot and by the
+//! DTI. The editor passes the user's selections ([`SlotChoice`]) to
+//! [`preprocess_with_choices`], which returns them, mapped onto the canonical
+//! text, in [`AssistOutput::slot_choices`] for
+//! [`crate::Session::ingest_with_choices`]. An annotated slot is a glyph or a
+//! label; an unannotated slot keeps the stage-1 role (anaphora for the exact
+//! tokens `~` / `~~`, glyph for every other token). When an unannotated token
+//! has more than one possible role, [`AssistNote::SlotRoleMenu`] asks the user
+//! to select one. A slot
 //! marked as a label is an inert string, never touched by the preprocessor
 //! (no normalization, no multiword, no glyph check): its content is irrelevant
 //! to the protocol, even if two identical labels denote different real-world
@@ -38,8 +47,6 @@
 
 use std::fmt;
 
-use crate::analyze::{ClauseId, GlobalClause, SlotIndex, SlotRef};
-use crate::ast::{ClauseRef, DefOperation};
 use crate::ast::{
     Comparative, Conditional, DefSignal, ExplicitNumber, PrimarySignal, Quantifier, Reflexive,
     SecondarySignal, Temporal, ANAPHORA_MARK, DEEP_SURFACE, QUALIFIER_SEPARATOR,
@@ -47,7 +54,7 @@ use crate::ast::{
 };
 use crate::dti::{Dti, DtiKey, FormResolution};
 use crate::error::DiagnosticKind;
-use crate::session::{PeriodId, Session, SlotKind};
+use crate::session::SlotKind;
 use crate::span::Span;
 use crate::stage3::{is_glyph_form, resolve_glyph_text, MorphFlag, ResolveError};
 use crate::tiles::{self, SignalParse};
@@ -91,9 +98,10 @@ pub struct AssistOutput {
     /// Canonical protocol text (single ASCII spaces, no comments).
     pub text: String,
     pub notes: Vec<AssistNote>,
-    /// Byte spans, in [`AssistOutput::text`], of the tokens the user marked as
-    /// labels: pass them to [`apply_label_choices`] after ingesting `text`.
-    pub labels: Vec<Span>,
+    /// Glyph / Label annotations of the user, as byte spans in
+    /// [`AssistOutput::text`]: pass them to
+    /// [`crate::Session::ingest_with_choices`] together with `text`.
+    pub slot_choices: Vec<(Span, SlotKind)>,
 }
 
 /// Glyph / Label selection of the user for one even-slot token (v4.1).
@@ -121,14 +129,22 @@ pub enum AssistNote {
     /// A token marked as a label that is not censused as a label of the local
     /// DTI: the editor asks the user to census it (`label <KEY> <form>`).
     UncensusedLabel { token: String, span: Span },
-    /// An unmarked form that the local DTI holds only as a label (v4.1): the
-    /// selection is mandatory, the editor asks the user to confirm **Label**
-    /// (or **Glyph**) and passes the choice as a [`SlotChoice`].
-    Label { token: String, span: Span },
-    /// An unmarked form that the local DTI holds both as a glyph and as a label
-    /// (v4.1): the editor opens the mandatory Glyph / Label menu and passes the
-    /// choice as a [`SlotChoice`].
-    GlyphOrLabel { token: String, span: Span },
+    /// An unannotated even-slot token with more than one possible role (v4.1):
+    /// the editor opens the slot menu and passes the user's selection as a
+    /// [`SlotChoice`]. One rule for every token, whatever its characters:
+    /// `anaphora` is set when the unannotated role of the token is the
+    /// anaphora (the exact tokens `~` / `~~`, as in stage 1), `glyph` / `label`
+    /// when the DTI censuses the token as a glyph / as a label. The menu opens
+    /// when the token is censused as a label, or when its unannotated role is
+    /// the anaphora and the DTI also censuses it. Without a selection the slot
+    /// keeps its unannotated role (anaphora for `~` / `~~`, glyph otherwise).
+    SlotRoleMenu {
+        token: String,
+        span: Span,
+        anaphora: bool,
+        glyph: bool,
+        label: bool,
+    },
     /// A multiword display form replaced by the primary form of its key.
     MultiwordGlyph {
         phrase: String,
@@ -490,8 +506,8 @@ struct Assist<'a, 's> {
     last_portability: bool,
     /// Glyph / Label selections of the user.
     choices: &'s [SlotChoice],
-    /// Indices in `out` of the tokens marked as labels.
-    label_tokens: Vec<usize>,
+    /// Indices in `out` of the annotated tokens, with their kind.
+    chosen_tokens: Vec<(usize, SlotKind)>,
 }
 
 /// Preprocesses assisted input into canonical protocol text, without Glyph /
@@ -507,8 +523,8 @@ pub fn preprocess_assisted_input(
 }
 
 /// Preprocesses assisted input with the Glyph / Label selections of the user
-/// (v4.1). Tokens marked as labels stay untouched and are listed in
-/// [`AssistOutput::labels`].
+/// (v4.1). Tokens marked as labels stay untouched; every annotated token is
+/// listed in [`AssistOutput::slot_choices`].
 pub fn preprocess_with_choices(
     input: &str,
     settings: &AssistSettings,
@@ -528,23 +544,23 @@ pub fn preprocess_with_choices(
         next_depth: 0,
         last_portability: false,
         choices,
-        label_tokens: Vec::new(),
+        chosen_tokens: Vec::new(),
     };
     assist.run();
     if assist.diagnostics.is_empty() {
-        let mut labels = Vec::with_capacity(assist.label_tokens.len());
+        let mut slot_choices = Vec::with_capacity(assist.chosen_tokens.len());
         let mut offset: usize = 0;
         for (index, token) in assist.out.iter().enumerate() {
             let end = offset.saturating_add(token.len());
-            if assist.label_tokens.contains(&index) {
-                labels.push(span_of(offset, end));
+            if let Some((_, kind)) = assist.chosen_tokens.iter().find(|(i, _)| *i == index) {
+                slot_choices.push((span_of(offset, end), *kind));
             }
             offset = end.saturating_add(1);
         }
         Ok(AssistOutput {
             text: assist.out.join(" "),
             notes: assist.notes,
-            labels,
+            slot_choices,
         })
     } else {
         assist
@@ -873,18 +889,22 @@ impl Assist<'_, '_> {
                     });
                 }
             }
-            self.label_tokens.push(self.out.len());
+            self.chosen_tokens.push((self.out.len(), SlotKind::Label));
             self.out.push(token.text.to_owned());
             return 0;
         }
-        if role == GlyphRole::Normal {
+        if role == GlyphRole::Normal && choice.is_none() {
             if let Some(extra) = self.try_multiword(index) {
                 return extra;
             }
         }
-        let text = self.normalize_glyph(token);
+        let chosen = choice.is_some();
+        let text = self.normalize_glyph(token, chosen);
         if role == GlyphRole::Normal {
-            self.check_unknown(token, &text, choice.is_some());
+            self.check_unknown(token, &text, chosen);
+        }
+        if chosen {
+            self.chosen_tokens.push((self.out.len(), SlotKind::Glyph));
         }
         self.out.push(text);
         0
@@ -892,14 +912,14 @@ impl Assist<'_, '_> {
 
     /// Normalizes an even-slot token into its primary form: the whole token
     /// first (DTI priority, a form may contain `§`), otherwise every `§`
-    /// segment on its own. Labels of the local DTI and the exact operators
-    /// `~` / `~~` are unchanged.
-    fn normalize_glyph(&mut self, token: Token<'_>) -> String {
+    /// segment on its own. Labels of the local DTI are unchanged, and so is a
+    /// token whose unannotated role is the anaphora (no glyph to normalize).
+    fn normalize_glyph(&mut self, token: Token<'_>, chosen_glyph: bool) -> String {
         let text = token.text;
         let Some(dti) = self.dti else {
             return text.to_owned();
         };
-        if is_anaphora_operator(text) {
+        if is_unannotated_anaphora(text) && !chosen_glyph {
             return text.to_owned();
         }
         if !text.contains(QUALIFIER_SEPARATOR) || dti.resolve_form(text) != FormResolution::Unknown
@@ -1037,31 +1057,31 @@ impl Assist<'_, '_> {
 
     /// Checks a Normal glyph slot against the DTI after normalization: `text`
     /// is the normalized (primary-form) text of `token`; `chosen` is `true` when
-    /// the user already selected Glyph for this slot.
+    /// the user already selected Glyph for this slot. One rule for every token:
+    /// the slot menu opens for an unannotated token with more than one possible
+    /// role; the glyph checks apply when the role of the slot is the glyph.
     fn check_unknown(&mut self, token: Token<'_>, text: &str, chosen: bool) {
         let Some(dti) = self.dti else {
             return;
         };
-        if is_anaphora_operator(text) {
-            return;
+        // Unannotated role (stage 1): anaphora for `~` / `~~`, glyph otherwise.
+        let anaphora = !chosen && is_unannotated_anaphora(token.text);
+        let glyph =
+            is_known_glyph(dti, text) || dti.resolve_form(token.text) != FormResolution::Unknown;
+        let label = dti.label(token.text).is_some();
+        if !chosen && (label || (anaphora && glyph)) {
+            self.notes.push(AssistNote::SlotRoleMenu {
+                token: token.text.to_owned(),
+                span: token.span(),
+                anaphora,
+                glyph,
+                label,
+            });
         }
-        let glyph = is_known_glyph(dti, text);
-        if !chosen && dti.label(token.text).is_some() {
-            let note = if glyph {
-                AssistNote::GlyphOrLabel {
-                    token: token.text.to_owned(),
-                    span: token.span(),
-                }
-            } else {
-                AssistNote::Label {
-                    token: token.text.to_owned(),
-                    span: token.span(),
-                }
-            };
-            self.notes.push(note);
-            if !glyph {
-                return;
-            }
+        // Not a glyph slot (anaphora), or an unannotated label-only form: no
+        // glyph check until the user selects the role.
+        if anaphora || (!chosen && label && !glyph) {
+            return;
         }
         // B9: the morphology flags are validated as in stage 3, on primary forms.
         if let Err(ResolveError::MorphViolation { form, key, flag }) = resolve_glyph_text(text, dti)
@@ -1081,63 +1101,10 @@ impl Assist<'_, '_> {
     }
 }
 
-/// Records in the session the Label choices returned by
-/// [`preprocess_with_choices`] (v4.1): `labels` are byte spans in the text that
-/// was ingested in a single [`Session::ingest`] call, `ids` the periods that
-/// call produced. Returns the number of slots marked as labels.
-pub fn apply_label_choices(session: &mut Session, ids: &[PeriodId], labels: &[Span]) -> usize {
-    let mut marked: Vec<SlotRef> = Vec::new();
-    for id in ids {
-        let Some(period) = session.period(*id) else {
-            continue;
-        };
-        let count = u32::try_from(period.clause_count()).unwrap_or(u32::MAX);
-        for index in 0..count {
-            let Some(block) = period.clause(index) else {
-                break;
-            };
-            let clause = GlobalClause {
-                period: *id,
-                clause: ClauseId::new(index),
-            };
-            let spans: Vec<(u32, Span)> = match block {
-                ClauseRef::Relational(block) => (0_u32..)
-                    .zip(
-                        std::iter::once(block.signal.glyph.span)
-                            .chain(block.cases.iter().map(|pair| pair.glyph.span)),
-                    )
-                    .collect(),
-                ClauseRef::Definition(block) => (1_u32..)
-                    .zip(block.operations.iter())
-                    .filter_map(|(position, op)| match op {
-                        DefOperation::Assign { value, .. }
-                        | DefOperation::Modify { value, .. }
-                        | DefOperation::Union { value, .. } => Some((position, value.span)),
-                        DefOperation::Unbind { .. } => None,
-                    })
-                    .collect(),
-                ClauseRef::Portability(_) => Vec::new(),
-            };
-            marked.extend(
-                spans
-                    .into_iter()
-                    .filter(|(_, span)| labels.contains(span))
-                    .map(|(position, _)| SlotRef {
-                        clause,
-                        slot: SlotIndex::new(position),
-                    }),
-            );
-        }
-    }
-    marked
-        .into_iter()
-        .filter(|slot| session.set_slot_kind(*slot, SlotKind::Label))
-        .count()
-}
-
-/// The exact anaphora operators `~` and `~~` (the only non-glyph tokens of an
-/// even slot).
-fn is_anaphora_operator(text: &str) -> bool {
+/// Unannotated role of an even-slot token, the same classification as stage 1
+/// (`parse_glyph_slot`): `true` when the token is exactly `~` or `~~`, whose
+/// unannotated role is the anaphora. An annotated slot is never an anaphora.
+fn is_unannotated_anaphora(text: &str) -> bool {
     text == SEMA_ANAPHORA_MARK || text.strip_prefix(ANAPHORA_MARK) == Some("")
 }
 

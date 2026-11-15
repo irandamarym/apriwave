@@ -28,9 +28,8 @@
 //! label <KEY> <form>
 //! ```
 //!
-//! v4.1: a lexical form is any glyph token (any visible character, `§`
-//! included) except the two anaphora operators `~` and `~~`; only invisible
-//! characters are refused (D9). A `label` record censuses a local label: the
+//! v4.1: a lexical form is any non-empty token of visible characters (`§`,
+//! `~` and `~~` included); only invisible characters are refused (D9). A `label` record censuses a local label: the
 //! same form may coexist as a glyph and as a label. A census warning (never an
 //! error) is recorded when a local glyph or label form is already the primary
 //! form of another universal glyph in the exchange language.
@@ -136,7 +135,7 @@ impl fmt::Display for DtiErrorKind {
             Self::InvalidKey(err) => write!(f, "{err}"),
             Self::DuplicateKey(key) => write!(f, "duplicate key {key}"),
             Self::InvalidForm => f.write_str(
-                "lexical form is not a glyph token (invisible character, or the operator `~` / `~~`)",
+                "lexical form is empty or contains a space or an invisible character",
             ),
             Self::DuplicateLabel => f.write_str("label form already censused in this overlay"),
             Self::DuplicatePrimary => f.write_str("primary form already used in this language"),
@@ -261,18 +260,14 @@ fn parse_key(text: &str) -> Result<DtiKey, DtiErrorKind> {
 pub(super) struct FormValidator;
 
 impl FormValidator {
-    /// A lexical form (primary, `form:`, `syn:`, label) is any glyph token
-    /// (v4.1): any visible character, `§` included (a form containing `§` is
-    /// looked up whole before any segment resolution), except the two exact
-    /// anaphora operators `~` and `~~` and the invisible characters (D9).
-    /// Human multiword forms use `display:`.
+    /// A lexical form (primary, `form:`, `syn:`, label) is any non-empty
+    /// sequence of visible characters without spaces (v4.1), `§`, `~` and `~~`
+    /// included (a form containing `§` is looked up whole before any segment
+    /// resolution; `~` / `~~` are used as glyphs or labels in slots annotated
+    /// as such). Only invisible characters are refused (D9). Human multiword
+    /// forms use `display:`.
     fn check(&mut self, form: &str) -> Result<(), DtiErrorKind> {
-        if form.is_empty()
-            || form.contains(' ')
-            || form == crate::ast::SEMA_ANAPHORA_MARK
-            || (form.len() == crate::ast::ANAPHORA_MARK.len_utf8()
-                && form.starts_with(crate::ast::ANAPHORA_MARK))
-        {
+        if form.is_empty() || form.contains(' ') {
             return Err(DtiErrorKind::InvalidForm);
         }
         crate::glyph::check_glyph_text(form).map_err(|_| DtiErrorKind::InvalidForm)

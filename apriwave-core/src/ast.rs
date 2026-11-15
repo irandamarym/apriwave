@@ -775,9 +775,11 @@ impl From<Option<ExplicitNumber>> for QuantumNumber {
 
 // ═══════════════════════════ Glyph slot ═══════════════════════════
 
-/// Content of an even slot (v4.1, Slot Locking: `1 Tile -> 1 Glyph`). Every
-/// token in an even slot is a glyph, except the two exact anaphora operators
-/// `~` and `~~`.
+/// Content of an even slot (v4.1, Slot Locking: `1 Tile -> 1 Glyph`). One rule
+/// for every token, whatever its characters: a slot annotated as a glyph or a
+/// label ([`crate::Session::ingest_with_choices`]) is a [`GlyphSlot::Glyph`];
+/// an unannotated slot takes its stage-1 role: the anaphora for the exact
+/// tokens `~` / `~~`, the glyph for every other token.
 #[derive(Debug, PartialEq, Eq)]
 pub enum GlyphSlot {
     Glyph(GlyphPath),

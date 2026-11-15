@@ -255,6 +255,8 @@ fn dti() -> Result<Dti, String> {
     ));
     // v4.1: a DTI form may contain `§` (one glyph, one key).
     universal.push_str(&format!("rec {} red§wine\n", k("redwine")?));
+    // v4.1: `~` censused as a glyph (used only in slots annotated as glyphs).
+    universal.push_str(&format!("rec {} ~\n", k("tilde")?));
     let mut local = String::from("#awdti 1\n#role local\n#universal 7\n#lang it\n");
     for key in &digits {
         local.push_str(&format!("use {key}\n"));
@@ -278,6 +280,8 @@ fn dti() -> Result<Dti, String> {
     local.push_str(&format!("use {} form:porta syn:uscio\n", k("door")?));
     local.push_str(&format!("use {} form:portare syn:uscio\n", k("carry")?));
     local.push_str(&format!("use {}\n", k("redwine")?));
+    local.push_str(&format!("use {}\n", k("tilde")?));
+    local.push_str(&format!("label {} ~~\n", k("labeltildes")?));
     // v4.1 labels: `verde` is also a glyph (homonymy).
     local.push_str(&format!("label {} Roma\n", k("labelroma")?));
     local.push_str(&format!("label {} verde\n", k("labelverde")?));
@@ -1006,5 +1010,101 @@ fn receiver_treats_lva_tokens_as_labels_v4_1() -> TestResult {
                 .collect(),
         ),
         Ok(report) => Err(format!("accepted: {report:?}")),
+    }
+}
+
+// ═══════════════════════════ `~` / `~~` as annotated glyphs (v4.1) ═══════════════════════════
+
+#[test]
+fn annotated_tildes_are_glyphs_and_labels_v4_1() -> TestResult {
+    use crate::analyze::Resolution;
+    use crate::span::Span;
+    let dti = dti()?;
+    // `~` (glyph) and `~~` (label) in the first block, which has no antecedent;
+    // the unannotated `~` of the second block stays an anaphora.
+    let src = "/^ ta ~ nu ~~ : ta vedere nu ~ ^/";
+    let choices = [
+        (Span::new(6, 7), SlotKind::Glyph),
+        (Span::new(11, 13), SlotKind::Label),
+    ];
+    let mut session = Session::new();
+    let ids = session
+        .ingest_with_choices(src, &choices)
+        .map_err(|d| format!("{d:#?}"))?;
+    let id = ids.first().copied().ok_or("no period")?;
+    let resolution = |clause: u32, position: u32| {
+        session
+            .analysis(id)
+            .and_then(|p| p.clause(ClauseId::new(clause)))
+            .and_then(|c| c.slot(SlotIndex::new(position)))
+            .map(|slot| slot.resolution())
+    };
+    check("~ literal", resolution(0, 0), Some(Resolution::Literal))?;
+    check("~~ literal", resolution(0, 1), Some(Resolution::Literal))?;
+    check(
+        "unannotated ~ is an anaphora",
+        matches!(resolution(1, 1), Some(Resolution::GlyphAnaphora { .. })),
+        true,
+    )?;
+    check(
+        "kinds recorded",
+        (
+            session.slot_kind(slot(id, 0, 0)),
+            session.slot_kind(slot(id, 0, 1)),
+            session.slot_kind(slot(id, 1, 1)),
+        ),
+        (Some(SlotKind::Glyph), Some(SlotKind::Label), None),
+    )?;
+    check(
+        "indexed",
+        render_indexed_period(&session, id, &dti),
+        Ok(format!(
+            "/^ ta {} nu LVAAAA~~ : ta {} nu ~ ^/",
+            k("tilde")?,
+            k("see")?
+        )),
+    )?;
+    // A `~` label travels as `LVAAAA~`.
+    let mut session = Session::new();
+    let ids = session
+        .ingest_with_choices(
+            "/^ ta vedere nu ~ ^/",
+            &[(Span::new(16, 17), SlotKind::Label)],
+        )
+        .map_err(|d| format!("{d:#?}"))?;
+    let id = ids.first().copied().ok_or("no period")?;
+    check(
+        "label ~",
+        render_indexed_period(&session, id, &dti),
+        Ok(format!("/^ ta {} nu LVAAAA~ ^/", k("see")?)),
+    )?;
+    // Without annotations, the same first block has no antecedent.
+    match Session::new().ingest("/^ ta ~ nu ~~ ^/") {
+        Err(d)
+            if d.iter()
+                .any(|x| x.kind == crate::DiagnosticKind::UnresolvedGlyphAnaphora) => {}
+        other => return Err(format!("expected an unresolved anaphora, got {other:?}")),
+    }
+    // Annotated `~` is never the `abse ~` / `end ~` marker.
+    match Session::new().ingest_with_choices(
+        "/^ defu x a y y defu x abse ~ ^/",
+        &[(Span::new(28, 29), SlotKind::Glyph)],
+    ) {
+        Err(d)
+            if d.iter()
+                .any(|x| x.kind == crate::DiagnosticKind::UnbindRequiresTilde) => {}
+        other => return Err(format!("expected UnbindRequiresTilde, got {other:?}")),
+    }
+    match Session::new().ingest_with_choices(
+        "/^ ta x : anchor p : end ~ ^/",
+        &[(Span::new(25, 26), SlotKind::Glyph)],
+    ) {
+        Err(d)
+            if d.iter()
+                .any(|x| x.kind == crate::DiagnosticKind::EndRequiresTilde) =>
+        {
+            Ok(())
+        }
+        other => Err(format!("expected EndRequiresTilde, got {other:?}")),
     }
 }

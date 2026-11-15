@@ -23,8 +23,8 @@ mod toml;
 
 pub use copy::{copy_subordinates, CopiedBlock, CopyError, CopyMode, GENERATED_ID_PREFIX};
 pub use preprocess::{
-    apply_label_choices, preprocess_assisted_input, preprocess_with_choices, AssistDiagnostic,
-    AssistDiagnosticKind, AssistNote, AssistOutput, AssistSettings, SlotChoice,
+    preprocess_assisted_input, preprocess_with_choices, AssistDiagnostic, AssistDiagnosticKind,
+    AssistNote, AssistOutput, AssistSettings, SlotChoice,
 };
 pub use settings::{
     parse_settings, ActionShortcuts, Autocomplete, Chord, ChordError, ComparativeShortcuts,

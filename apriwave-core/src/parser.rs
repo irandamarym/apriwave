@@ -15,7 +15,7 @@ use crate::ast::{
     ANAPHORA_MARK,
 };
 use crate::error::{Diagnostic, DiagnosticKind, Expected, Limit, Severity, WarningCodes};
-use crate::glyph::parse_glyph_slot;
+use crate::glyph::{parse_glyph_slot, parse_path};
 use crate::lexer::RawToken;
 use crate::span::{Span, Spanned};
 use crate::symbol::Interner;
@@ -82,6 +82,9 @@ pub struct Parser<'t, 'src, 'i> {
     config: ParserConfig,
     end: Span,
     diagnostics: Vec<Diagnostic>,
+    /// Even-slot tokens annotated as Glyph or Label (v4.1): always glyphs,
+    /// even when they are exactly `~` or `~~`.
+    literal_slots: &'t [Span],
 }
 
 impl<'t, 'src, 'i> Parser<'t, 'src, 'i> {
@@ -98,7 +101,21 @@ impl<'t, 'src, 'i> Parser<'t, 'src, 'i> {
             config,
             end,
             diagnostics: Vec::new(),
+            literal_slots: &[],
         }
+    }
+
+    /// Even-slot tokens (byte spans in the source) annotated as Glyph or Label
+    /// (v4.1): they are parsed as glyphs, also when they are exactly `~` or
+    /// `~~`; every other `~` / `~~` stays an anaphora operator or marker.
+    #[must_use]
+    pub fn with_literal_slots(mut self, spans: &'t [Span]) -> Self {
+        self.literal_slots = spans;
+        self
+    }
+
+    fn is_literal(&self, span: Span) -> bool {
+        self.literal_slots.contains(&span)
     }
 
     pub fn into_diagnostics(self) -> Vec<Diagnostic> {
@@ -385,7 +402,12 @@ impl<'t, 'src, 'i> Parser<'t, 'src, 'i> {
     }
 
     fn parse_glyph(&mut self, token: RawToken<'src>) -> Option<Spanned<GlyphSlot>> {
-        match parse_glyph_slot(token.text, self.interner) {
+        let parsed = if self.is_literal(token.span) {
+            parse_path(token.text, self.interner).map(GlyphSlot::Glyph)
+        } else {
+            parse_glyph_slot(token.text, self.interner)
+        };
+        match parsed {
             Ok(slot) => Some(Spanned::new(slot, token.span)),
             Err(kind) => {
                 self.report(kind, token.span);
@@ -523,7 +545,12 @@ impl<'t, 'src, 'i> Parser<'t, 'src, 'i> {
             PortabilityKeyword::RelOff => |keyword, id| PortabilityBlock::RelOff { keyword, id },
         };
 
-        let path = match parse_glyph_slot(token.text, self.interner) {
+        let parsed = if self.is_literal(token.span) {
+            parse_path(token.text, self.interner).map(GlyphSlot::Glyph)
+        } else {
+            parse_glyph_slot(token.text, self.interner)
+        };
+        let path = match parsed {
             Ok(GlyphSlot::Glyph(path)) => path,
             Ok(_) => {
                 self.report(DiagnosticKind::PortabilityOperandInvalid, token.span);
@@ -537,13 +564,17 @@ impl<'t, 'src, 'i> Parser<'t, 'src, 'i> {
         Some(build(keyword_span, Spanned::new(path, token.span)))
     }
 
-    /// `end ~`: the operand must be exactly the `~` anaphora.
+    /// `end ~`: the operand must be exactly the `~` marker (not annotated as a
+    /// glyph or label).
     fn end_operand(
         &mut self,
         keyword_span: Span,
         token: RawToken<'src>,
     ) -> Option<PortabilityBlock> {
-        if token.text.len() == ANAPHORA_MARK.len_utf8() && token.text.starts_with(ANAPHORA_MARK) {
+        if token.text.len() == ANAPHORA_MARK.len_utf8()
+            && token.text.starts_with(ANAPHORA_MARK)
+            && !self.is_literal(token.span)
+        {
             Some(PortabilityBlock::End {
                 keyword: keyword_span,
                 tilde: token.span,

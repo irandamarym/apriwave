@@ -129,8 +129,9 @@ fn glyph_slots(block: ClauseRef<'_>) -> Vec<(u32, &GlyphSlot)> {
 /// Suggestions for `prefix`, in this order: the glyphs of the session (most
 /// recent first, `def` names included), the labels of the local DTI, then the
 /// semas of the session (most recent first) whose canonical text or signal
-/// glyph starts with `prefix`. A form that the local DTI holds both as a glyph
-/// and as a label yields both entries (disambiguation menu). At most
+/// glyph starts with `prefix`. Every form follows the same rule, whatever its
+/// characters (`~` and `~~` included): a form that the local DTI holds both as
+/// a glyph and as a label yields both entries (disambiguation menu). At most
 /// [`MAX_SUGGESTIONS`] entries, without duplicates.
 pub fn suggestions(prefix: &str, session: &Session, dti: Option<&Dti>) -> Vec<Suggestion> {
     let mut collector = Collector {

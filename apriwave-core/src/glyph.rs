@@ -1,7 +1,11 @@
 //! Classification of the tokens in **even slots** (v4.1).
 //!
-//! Slot Locking (`1 Tile -> 1 Glyph`): every token in an even slot is a glyph,
-//! except the two exact anaphora operators `~` and `~~`. A glyph may contain any
+//! Slot Locking (`1 Tile -> 1 Glyph`), one rule for every token whatever its
+//! characters: the role of an even-slot token is fixed by the annotation of
+//! its slot. A slot annotated as a glyph or a label is parsed with
+//! [`parse_path`] (a glyph path, `~` / `~~` included); an unannotated slot is
+//! classified by [`parse_glyph_slot`], which gives the anaphora role to the
+//! exact tokens `~` / `~~` and the glyph role to every other token. A glyph may contain any
 //! visible character (any alphabet, uppercase, punctuation, symbols, `§`, `"`,
 //! period delimiters, `:`…); the grammar never judges its content.
 //! D9: only invisible characters are refused: control characters (`Cc`) and the
@@ -69,7 +73,9 @@ pub(crate) fn parse_path(text: &str, interner: &mut Interner) -> Result<GlyphPat
     })
 }
 
-/// Classifies the content of an even slot.
+/// Classifies the content of an **unannotated** even slot (its stage-1 role):
+/// anaphora for the exact tokens `~` / `~~`, glyph for every other token.
+/// Annotated slots never come here: the parser reads them with [`parse_path`].
 pub(crate) fn parse_glyph_slot(
     text: &str,
     interner: &mut Interner,

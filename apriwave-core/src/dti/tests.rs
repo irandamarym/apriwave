@@ -358,7 +358,7 @@ fn record_errors() -> TestResult {
         DtiSource::Universal,
         DtiErrorKind::DuplicatePrimary,
     )?;
-    // v4.1: uppercase and `_` are valid in forms; `~` alone is not.
+    // v4.1: uppercase and `_` are valid in forms; an invisible character is not.
     Dti::load(
         &format!(
             "{}rec {} Green\nrec {} a_b\n",
@@ -370,7 +370,7 @@ fn record_errors() -> TestResult {
     )
     .map_err(|d| format!("{d:#?}"))?;
     expect_error(
-        &format!("{}rec {} ~\n", f.universal, k("tilde")?),
+        &format!("{}rec {} x\u{200F}\n", f.universal, k("bidi")?),
         &f.local,
         DtiSource::Universal,
         DtiErrorKind::InvalidForm,
@@ -469,8 +469,8 @@ fn forms_admit_any_visible_character_v4_1() -> TestResult {
         dti.resolve_primary("東京"),
         FormResolution::Unique(key("door")?),
     )?;
-    // Only the anaphora operators and invisible characters are refused.
-    for bad in ["~", "~~", "x\u{202E}y", "x\u{200B}"] {
+    // Only invisible characters are refused.
+    for bad in ["x\u{202E}y", "x\u{200B}", "\u{FEFF}"] {
         expect_error(
             &f.universal.replacen("door\n", &format!("{bad}\n"), 1),
             &f.local,
@@ -638,7 +638,7 @@ fn overlay_rules_b5_b6_d6() -> TestResult {
 #[test]
 fn all_diagnostics_are_collected_and_sorted() -> TestResult {
     let f = fixture()?;
-    let universal = format!("{}rec {} ~~\nrec bad x\n", f.universal, k("bad1")?);
+    let universal = format!("{}rec {} x\u{202E}\nrec bad x\n", f.universal, k("bad1")?);
     let local = format!("{}use {}\n", f.local, k("ghost")?);
     match Dti::load(&universal, &local) {
         Ok(_) => Err("accepted".to_owned()),
@@ -652,4 +652,37 @@ fn all_diagnostics_are_collected_and_sorted() -> TestResult {
             )
         }
     }
+}
+
+#[test]
+fn tilde_forms_are_valid_glyphs_and_labels_v4_1() -> TestResult {
+    let f = fixture()?;
+    // `~` and `~~` may be censused as glyphs (universal or local) and as labels.
+    let universal = format!("{}rec {} ~ syn:≈\n", f.universal, k("tilde")?);
+    let local = format!(
+        "{}use {} form:~\nnew {} ~~\nlabel {} ~\nlabel {} ~~\n",
+        f.local,
+        k("tilde")?,
+        k("localtildes")?,
+        k("labeltilde")?,
+        k("labeltildes")?
+    );
+    let dti = Dti::load(&universal, &local).map_err(|d| format!("{d:#?}"))?;
+    check(
+        "glyph ~",
+        dti.resolve_primary("~"),
+        FormResolution::Unique(key("tilde")?),
+    )?;
+    check(
+        "glyph ~~",
+        dti.resolve_primary("~~"),
+        FormResolution::Unique(key("localtildes")?),
+    )?;
+    check("label ~", dti.label("~"), Some(key("labeltilde")?))?;
+    check("label ~~", dti.label("~~"), Some(key("labeltildes")?))?;
+    check(
+        "synonym of ~",
+        dti.resolve_form("≈"),
+        FormResolution::Unique(key("tilde")?),
+    )
 }

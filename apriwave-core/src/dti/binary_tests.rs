@@ -499,12 +499,12 @@ fn invalid(kind: DtiErrorKind, source: DtiSource, line: u32) -> DtiLoadError {
 #[test]
 fn decoder_applies_the_shared_model_invariants() -> TestResult {
     let (a, b, c) = (key("aa")?, key("bb")?, key("cc")?);
-    // Forms: the anaphora operator is refused (v4.1: `§` is allowed).
+    // Forms: invisible characters are refused (v4.1: `§`, `~`, `~~` allowed).
     expect_error(
-        "operator as primary",
+        "invisible character in a primary",
         UniversalSnapshot::from_binary(&raw_universal(vec![(
             concept(a, None, None),
-            entry(a, "~~"),
+            entry(a, "x\u{200B}"),
         )])),
         &invalid(DtiErrorKind::InvalidForm, DtiSource::Universal, 1),
     )?;
@@ -589,4 +589,26 @@ fn decoder_applies_the_shared_model_invariants() -> TestResult {
         LocalOverlay::from_binary(&spoof, &universal),
         &invalid(DtiErrorKind::LocalShadowsUniversal(a), DtiSource::Local, 1),
     )
+}
+
+#[test]
+fn tilde_forms_round_trip_in_binary_v4_1() -> TestResult {
+    let (a, b, c, d) = (key("aa")?, key("bb")?, key("cc")?, key("dd")?);
+    let universal_bytes = raw_universal(vec![
+        (concept(a, None, None), entry(a, "~")),
+        (concept(b, None, None), entry(b, "~~")),
+    ]);
+    let (universal, _) =
+        UniversalSnapshot::from_binary(&universal_bytes).map_err(|e| e.to_string())?;
+    check("universal ~", universal.lexicon().primary("~"), Some(a))?;
+    check("universal ~~", universal.lexicon().primary("~~"), Some(b))?;
+    let local_src = format!(
+        "#awdti 1\n#role local\n#universal 1\n#lang it\nuse {a}\nuse {b}\nlabel {c} ~\nlabel {d} ~~\n"
+    );
+    let overlay = LocalOverlay::parse(&local_src, &universal).map_err(|e| format!("{e:#?}"))?;
+    let bytes = overlay.to_binary(fnv1a_64(local_src.as_bytes()));
+    let (decoded, _) = LocalOverlay::from_binary(&bytes, &universal).map_err(|e| e.to_string())?;
+    check("local model", &decoded, &overlay)?;
+    check("label ~", decoded.labels().key("~"), Some(c))?;
+    check("label ~~", decoded.labels().key("~~"), Some(d))
 }

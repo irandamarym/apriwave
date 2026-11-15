@@ -9,8 +9,10 @@ use crate::prelude::*;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 
-use crate::analyze::{self, AnalyzedPeriod, Binding, BindingId, Committed, GlobalClause, SlotRef};
-use crate::ast::{GlyphSlot, Period, PeriodClose};
+use crate::analyze::{
+    self, AnalyzedPeriod, Binding, BindingId, ClauseId, Committed, GlobalClause, SlotIndex, SlotRef,
+};
+use crate::ast::{ClauseRef, DefOperation, GlyphSlot, Period, PeriodClose};
 use crate::error::{Diagnostic, DiagnosticKind, Limit};
 use crate::lexer;
 use crate::parser::{Parser, ParserConfig};
@@ -220,8 +222,26 @@ impl Session {
     /// `Ok` with the identifiers of the added periods; `Err` with **all** the
     /// collected diagnostics, sorted by position (Q25). Stage 2 runs
     /// only if stage 1 produced no diagnostics.
+    /// Without explicit choices every `~` / `~~` in an even slot is an
+    /// anaphora operator (or the `abse ~` / `end ~` marker).
     pub fn ingest(&mut self, src: &str) -> Result<Vec<PeriodId>, Vec<Diagnostic>> {
-        self.ingest_with_undo(src).map(|(ids, _undo)| ids)
+        self.ingest_with_undo(src, &[]).map(|(ids, _undo)| ids)
+    }
+
+    /// Like [`Session::ingest`], with the Glyph / Label annotations of the
+    /// even-slot tokens identified by their byte span in `src` (v4.1). One
+    /// rule for every token, whatever its characters (`~` / `~~` included): an
+    /// annotated token is a glyph at stages 1 and 2 (it resolves literally,
+    /// never as an anaphora); the
+    /// annotation is recorded atomically as the [`SlotKind`] of its slot.
+    /// Unannotated tokens keep their stage-1 role (anaphora or marker for the
+    /// exact `~` / `~~`, glyph otherwise).
+    pub fn ingest_with_choices(
+        &mut self,
+        src: &str,
+        choices: &[(Span, SlotKind)],
+    ) -> Result<Vec<PeriodId>, Vec<Diagnostic>> {
+        self.ingest_with_undo(src, choices).map(|(ids, _undo)| ids)
     }
 
     /// Like [`Session::ingest`], then runs `check` on the committed session; if
@@ -233,7 +253,7 @@ impl Session {
         check: impl FnOnce(&Session, &[PeriodId]) -> Result<(), Vec<E>>,
     ) -> Result<Vec<PeriodId>, CheckedIngestError<E>> {
         let (ids, undo) = self
-            .ingest_with_undo(src)
+            .ingest_with_undo(src, &[])
             .map_err(CheckedIngestError::Grammar)?;
         match check(self, &ids) {
             Ok(()) => Ok(ids),
@@ -274,11 +294,17 @@ impl Session {
         self.interner.rollback(undo.interner);
     }
 
-    fn ingest_with_undo(&mut self, src: &str) -> Result<(Vec<PeriodId>, Undo), Vec<Diagnostic>> {
+    fn ingest_with_undo(
+        &mut self,
+        src: &str,
+        choices: &[(Span, SlotKind)],
+    ) -> Result<(Vec<PeriodId>, Undo), Vec<Diagnostic>> {
         let lexed = lexer::lex(src).map_err(|d| vec![d])?;
         let mark = self.interner.mark();
 
-        let mut parser = Parser::new(&lexed.tokens, &mut self.interner, self.config, lexed.end);
+        let literal_slots: Vec<Span> = choices.iter().map(|(span, _)| *span).collect();
+        let mut parser = Parser::new(&lexed.tokens, &mut self.interner, self.config, lexed.end)
+            .with_literal_slots(&literal_slots);
         let periods = parser.parse_session(self.sync_antecedent);
         let mut diagnostics = lexed.diagnostics;
         diagnostics.extend(parser.into_diagnostics());
@@ -374,7 +400,41 @@ impl Session {
             undo.carried = CarriedUndo::Replaced(core::mem::take(&mut self.carried));
         }
         self.carried.extend(outcome.carried_tail);
+        self.record_choices(&ids, choices);
         Ok((ids, undo))
+    }
+
+    /// Records the Glyph / Label annotations of the periods just committed
+    /// (spans relative to the ingested source).
+    fn record_choices(&mut self, ids: &[PeriodId], choices: &[(Span, SlotKind)]) {
+        if choices.is_empty() {
+            return;
+        }
+        let mut found: Vec<(SlotRef, SlotKind)> = Vec::new();
+        for id in ids {
+            let Some(period) = self.period(*id) else {
+                continue;
+            };
+            for (index, spans) in period_glyph_spans(period) {
+                for (position, span) in spans {
+                    if let Some((_, kind)) = choices.iter().find(|(s, _)| *s == span) {
+                        found.push((
+                            SlotRef {
+                                clause: GlobalClause {
+                                    period: *id,
+                                    clause: ClauseId::new(index),
+                                },
+                                slot: SlotIndex::new(position),
+                            },
+                            *kind,
+                        ));
+                    }
+                }
+            }
+        }
+        for (slot, kind) in found {
+            self.set_slot_kind(slot, kind);
+        }
     }
 
     fn undo_point(&self, interner: InternerMark) -> Undo {
@@ -388,6 +448,36 @@ impl Session {
             sync_antecedent: self.sync_antecedent,
         }
     }
+}
+
+/// Byte spans of the glyph slots of every clause, by clause index and pair
+/// position (relational slots and `def` values).
+fn period_glyph_spans(period: &Period) -> Vec<(u32, Vec<(u32, Span)>)> {
+    let count = u32::try_from(period.clause_count()).unwrap_or(u32::MAX);
+    (0..count)
+        .map_while(|index| period.clause(index).map(|block| (index, block)))
+        .map(|(index, block)| {
+            let spans = match block {
+                ClauseRef::Relational(block) => (0_u32..)
+                    .zip(
+                        core::iter::once(block.signal.glyph.span)
+                            .chain(block.cases.iter().map(|pair| pair.glyph.span)),
+                    )
+                    .collect(),
+                ClauseRef::Definition(block) => (1_u32..)
+                    .zip(block.operations.iter())
+                    .filter_map(|(position, op)| match op {
+                        DefOperation::Assign { value, .. }
+                        | DefOperation::Modify { value, .. }
+                        | DefOperation::Union { value, .. } => Some((position, value.span)),
+                        DefOperation::Unbind { .. } => None,
+                    })
+                    .collect(),
+                ClauseRef::Portability(_) => Vec::new(),
+            };
+            (index, spans)
+        })
+        .collect()
 }
 
 /// Failure of [`Session::ingest_checked`].

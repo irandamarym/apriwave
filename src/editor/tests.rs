@@ -4,12 +4,11 @@
 use std::fmt::Debug;
 
 use super::{
-    apply_label_choices, copy_subordinates, parse_settings, preprocess_assisted_input,
-    preprocess_with_choices, suggestions, ActionShortcuts, AssistDiagnosticKind, AssistNote,
-    AssistOutput, AssistSettings, Autocomplete, Chord, ChordError, ComparativeShortcuts,
-    CopiedBlock, CopyError, CopyMode, EditorSettings, Key, KeyPress, SettingsErrorKind,
-    ShortcutAction, ShortcutContext, ShortcutOutcome, ShortcutResolver, SlotChoice, Suggestion,
-    SuggestionKind,
+    copy_subordinates, parse_settings, preprocess_assisted_input, preprocess_with_choices,
+    suggestions, ActionShortcuts, AssistDiagnosticKind, AssistNote, AssistOutput, AssistSettings,
+    Autocomplete, Chord, ChordError, ComparativeShortcuts, CopiedBlock, CopyError, CopyMode,
+    EditorSettings, Key, KeyPress, SettingsErrorKind, ShortcutAction, ShortcutContext,
+    ShortcutOutcome, ShortcutResolver, SlotChoice, Suggestion, SuggestionKind,
 };
 use crate::analyze::{ClauseId, GlobalClause, SlotIndex, SlotRef};
 use crate::ast::Comparative;
@@ -928,23 +927,32 @@ fn unmarked_labels_ask_for_the_mandatory_choice_v4_1() -> TestResult {
     // synonym of `casa`) is normalized; the notes ask for the selection.
     let out = assist("/^ ta Roma nu casa a dimora ^/", &dti)?;
     check("text", out.text.as_str(), "/^ ta Roma nu casa a casa ^/")?;
-    check("no label spans", out.labels, Vec::new())?;
+    check("no annotations", out.slot_choices, Vec::new())?;
     check(
         "notes",
         out.notes,
         vec![
-            AssistNote::Label {
+            AssistNote::SlotRoleMenu {
                 token: "Roma".to_owned(),
                 span: Span::new(6, 10),
+                anaphora: false,
+                glyph: false,
+                label: true,
             },
-            AssistNote::GlyphOrLabel {
+            AssistNote::SlotRoleMenu {
                 token: "casa".to_owned(),
                 span: Span::new(14, 18),
+                anaphora: false,
+                glyph: true,
+                label: true,
             },
             normalized("dimora", "casa", 21, 27),
-            AssistNote::GlyphOrLabel {
+            AssistNote::SlotRoleMenu {
                 token: "dimora".to_owned(),
                 span: Span::new(21, 27),
+                anaphora: false,
+                glyph: true,
+                label: true,
             },
         ],
     )
@@ -974,17 +982,18 @@ fn selected_labels_are_inert_and_travel_as_labels_v4_1() -> TestResult {
     check("text", out.text.as_str(), "/^ ta Roma nu casa a dimora ^/")?;
     check("notes", out.notes, Vec::new())?;
     check(
-        "label spans in the output",
-        out.labels.as_slice(),
-        &[Span::new(6, 10), Span::new(21, 27)][..],
+        "annotations in the output",
+        out.slot_choices.as_slice(),
+        &[
+            (Span::new(6, 10), SlotKind::Label),
+            (Span::new(14, 18), SlotKind::Glyph),
+            (Span::new(21, 27), SlotKind::Label),
+        ][..],
     )?;
     let mut session = Session::new();
-    let ids = session.ingest(&out.text).map_err(|d| format!("{d:#?}"))?;
-    check(
-        "marked slots",
-        apply_label_choices(&mut session, &ids, &out.labels),
-        2,
-    )?;
+    let ids = session
+        .ingest_with_choices(&out.text, &out.slot_choices)
+        .map_err(|d| format!("{d:#?}"))?;
     let id = ids.first().copied().ok_or("no period")?;
     check(
         "indexed",
@@ -1821,4 +1830,158 @@ fn copy_subordinates_absolute_and_relative_v4_1() -> TestResult {
 
 fn end_of(text: &str) -> Result<usize, String> {
     text.find(" ^/").ok_or_else(|| "no end".to_owned())
+}
+
+// ═══════════════════════════ `~` / `~~` as annotated glyphs (v4.1) ═══════════════════════════
+
+fn fixture_with_tildes() -> Result<Dti, String> {
+    let (green, tilde) = (key("green")?, key("tilde")?);
+    let universal = format!(
+        "#awdti 1\n#role universal\n#version 1\n#lang en\nrec {green} green\nrec {tilde} ~\n"
+    );
+    let local = format!(
+        "#awdti 1\n#role local\n#universal 1\n#lang it\nuse {green} form:verde\nuse {tilde}\nlabel {} ~\nlabel {} ~~\nlabel {} ^/\n",
+        key("labeltilde")?,
+        key("labeltildes")?,
+        key("labelclose")?
+    );
+    Dti::load(&universal, &local).map_err(|d| format!("{d:#?}"))
+}
+
+#[test]
+fn tildes_censused_in_the_dti_ask_anaphora_glyph_or_label_v4_1() -> TestResult {
+    let dti = fixture_with_tildes()?;
+    // Without an annotation `~` stays an anaphora; the note asks the user.
+    let out = assist("/^ ta verde nu ~ ^/", &dti)?;
+    check("text", out.text.as_str(), "/^ ta verde nu ~ ^/")?;
+    check("no annotation", out.slot_choices, Vec::new())?;
+    check(
+        "note",
+        out.notes,
+        vec![AssistNote::SlotRoleMenu {
+            token: "~".to_owned(),
+            span: Span::new(15, 16),
+            anaphora: true,
+            glyph: true,
+            label: true,
+        }],
+    )?;
+    // Annotated as a glyph: ingested as a literal glyph, indexed as its key.
+    let out = preprocess_with_choices(
+        "/^ ta  ~ nu ~~ ^/",
+        &AssistSettings::default(),
+        Some(&dti),
+        &[
+            SlotChoice {
+                span: Span::new(7, 8),
+                kind: SlotKind::Glyph,
+            },
+            SlotChoice {
+                span: Span::new(12, 14),
+                kind: SlotKind::Label,
+            },
+        ],
+    )
+    .map_err(|d| format!("{d:#?}"))?;
+    check("canonical text", out.text.as_str(), "/^ ta ~ nu ~~ ^/")?;
+    check("notes", out.notes, Vec::new())?;
+    check(
+        "annotations",
+        out.slot_choices.as_slice(),
+        &[
+            (Span::new(6, 7), SlotKind::Glyph),
+            (Span::new(11, 13), SlotKind::Label),
+        ][..],
+    )?;
+    let mut session = Session::new();
+    let ids = session
+        .ingest_with_choices(&out.text, &out.slot_choices)
+        .map_err(|d| format!("{d:#?}"))?;
+    let id = ids.first().copied().ok_or("no period")?;
+    check(
+        "indexed",
+        crate::stage3::render_indexed_period(&session, id, &dti).map_err(|e| e.to_string())?,
+        format!("/^ ta {} nu LVAAAA~~ ^/", key("tilde")?),
+    )
+}
+
+#[test]
+fn suggestions_offer_censused_tildes_v4_1() -> TestResult {
+    let dti = fixture_with_tildes()?;
+    let session = Session::new();
+    let entry = |kind: SuggestionKind, text: &str| Suggestion {
+        kind,
+        text: text.to_owned(),
+    };
+    check(
+        "prefix ~",
+        suggestions("~", &session, Some(&dti)),
+        vec![
+            entry(SuggestionKind::Glyph, "~"),
+            entry(SuggestionKind::Label, "~"),
+            entry(SuggestionKind::Label, "~~"),
+        ],
+    )?;
+    check(
+        "prefix ~~",
+        suggestions("~~", &session, Some(&dti)),
+        vec![entry(SuggestionKind::Label, "~~")],
+    )
+}
+
+#[test]
+fn one_slot_role_rule_for_every_token_v4_1() -> TestResult {
+    let dti = fixture_with_tildes()?;
+    // `^/` (censused as a label) and `~~` (censused as a label) follow the
+    // same rule: the slot menu lists the possible roles; only the unannotated
+    // role differs (glyph for `^/`, anaphora for `~~`, as in stage 1).
+    let out = assist("/^ ta verde nu ^/ a ~~ ^/", &dti)?;
+    check(
+        "notes",
+        out.notes,
+        vec![
+            AssistNote::SlotRoleMenu {
+                token: "^/".to_owned(),
+                span: Span::new(15, 17),
+                anaphora: false,
+                glyph: false,
+                label: true,
+            },
+            AssistNote::SlotRoleMenu {
+                token: "~~".to_owned(),
+                span: Span::new(20, 22),
+                anaphora: true,
+                glyph: false,
+                label: true,
+            },
+        ],
+    )?;
+    // The same annotation (Label) makes both tokens labels.
+    let out = preprocess_with_choices(
+        "/^ ta verde nu ^/ a ~~ ^/",
+        &AssistSettings::default(),
+        Some(&dti),
+        &[
+            SlotChoice {
+                span: Span::new(15, 17),
+                kind: SlotKind::Label,
+            },
+            SlotChoice {
+                span: Span::new(20, 22),
+                kind: SlotKind::Label,
+            },
+        ],
+    )
+    .map_err(|d| format!("{d:#?}"))?;
+    check("annotated notes", out.notes, Vec::new())?;
+    let mut session = Session::new();
+    let ids = session
+        .ingest_with_choices(&out.text, &out.slot_choices)
+        .map_err(|d| format!("{d:#?}"))?;
+    let id = ids.first().copied().ok_or("no period")?;
+    check(
+        "indexed",
+        crate::stage3::render_indexed_period(&session, id, &dti).map_err(|e| e.to_string())?,
+        format!("/^ ta {} nu LVAAAA^/ a LVAAAA~~ ^/", key("green")?),
+    )
 }
